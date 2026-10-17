@@ -2284,6 +2284,84 @@ void dequantize_row_ptq1_0(const block_ptq1_0 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ====================== PTQ1_1 (PTQ1_0, coded scale plane) ======================
+// A PTQ1_1 super-block is 8 PTQ1_0 sub-blocks. The qs bytes of each sub-block are
+// identical to PTQ1_0, so the same staging applies; the 8 tail trits are pooled at 5
+// per byte, and the scale becomes one code plus a raw 10 bit mantissa per sub-block.
+static const uint8_t * ptq1_1_codebook = NULL;
+
+void ggml_ptq1_1_set_codebook(const uint8_t * codebook) {
+    ptq1_1_codebook = codebook;
+}
+
+static const uint8_t ptq1_1_pow3[5] = {1, 3, 9, 27, 81};
+
+// one base-3 digit of a 5-trit byte, same expression as dequantize_row_ptq1_0
+static inline int ptq1_1_digit(const uint8_t byte, const int n) {
+    const uint8_t q = (uint8_t) (byte * ptq1_1_pow3[n]);
+    return (int) (((uint16_t) q * 3) >> 8);
+}
+
+// 8 exponents of 5 bits, little endian, 5 bytes per pattern
+static inline int ptq1_1_pattern_exp(const uint8_t * patt, const int s) {
+    uint64_t v = 0;
+    for (int i = 0; i < 5; ++i) {
+        v |= (uint64_t) patt[i] << (8*i);
+    }
+    return (int) ((v >> (5*s)) & 0x1F);
+}
+
+static inline uint32_t ptq1_1_mantissa(const uint8_t * sc, const int s) {
+    const int bit  = 10*s;
+    const int byte = bit >> 3;
+    const int off  = bit & 7;
+    uint32_t v = sc[byte];
+    if (byte + 1 < 10) { v |= (uint32_t) sc[byte + 1] << 8;  }
+    if (byte + 2 < 10) { v |= (uint32_t) sc[byte + 2] << 16; }
+    return (v >> off) & 0x3FF;
+}
+
+void dequantize_row_ptq1_1(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_PTQ1_1 == 0);
+    assert(ptq1_1_codebook != NULL);
+    const int64_t nb = k / QK_PTQ1_1;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const block_ptq1_1 * b = x + i;
+
+        const int code = b->sc[10]*3 + ptq1_1_digit(b->qh[12], 4);
+        // the escape pattern is per super-block, so it cannot be resolved from the
+        // block pointer alone; only the loader knows the table
+        if (code >= 767) {
+            GGML_ABORT("ptq1_1: escape code in the reference dequantizer");
+        }
+        const uint8_t * patt = ptq1_1_codebook + 5*code;
+
+        for (int s = 0; s < 8; ++s) {
+            const uint16_t bits = (uint16_t) ((ptq1_1_pattern_exp(patt, s) << 10) | ptq1_1_mantissa(b->sc, s));
+            ggml_fp16_t  dh;
+            memcpy(&dh, &bits, sizeof(dh));
+            const float d = GGML_FP16_TO_FP32(dh);
+
+            size_t j = 0;
+            for (size_t st = 0; st < 3; ++st) {
+                const size_t c = ptq1_0_stages[st];
+                for (; j + c <= sizeof(b->qs[s]); j += c) {
+                    for (size_t n = 0; n < 5; ++n) {
+                        for (size_t m = 0; m < c; ++m) {
+                            *y++ = (float) (ptq1_1_digit(b->qs[s][j + m], (int) n) - 1) * d;
+                        }
+                    }
+                }
+            }
+            for (int kk = 0; kk < 8; ++kk) {
+                const int p = 8*s + kk;
+                *y++ = (float) (ptq1_1_digit(b->qh[p/5], p%5) - 1) * d;
+            }
+        }
+    }
+}
+
 size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // ternary codes come from the weights themselves; an imatrix has no role
     const size_t row_size = ggml_row_size(GGML_TYPE_PTQ1_0, n_per_row);

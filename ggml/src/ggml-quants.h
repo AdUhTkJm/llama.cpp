@@ -49,6 +49,10 @@ GGML_API void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_ptq1_0(const block_ptq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_ptq1_1(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// PTQ1_1 codes index a model-wide pattern table that cannot live in the tensor
+// buffer, because type_size is exact. The loader installs it before use.
+GGML_API void ggml_ptq1_1_set_codebook(const uint8_t * codebook);
 GGML_API void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

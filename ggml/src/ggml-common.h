@@ -103,6 +103,8 @@ typedef sycl::half2 ggml_half2;
 #define QR_PQ2_0 1
 #define QI_PTQ1_0 (QK_PTQ1_0 / 32)
 #define QR_PTQ1_0 1
+#define QI_PTQ1_1 (QK_PTQ1_1 / 32)
+#define QR_PTQ1_1 1
 
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
@@ -218,6 +220,20 @@ typedef struct {
     ggml_half d;                                // scale
 } block_ptq1_0;
 static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 + (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
+// PTQ1_1: PTQ1_0 with the scale plane compressed. The group grows to 1024 weights
+// so one code can describe the exponents of eight 128-weight sub-blocks; the fp16
+// exponent is then ~1 bit per sub-block instead of 5. The qs staging of each
+// sub-block is unchanged, and the 8 tail trits are pooled at 5 per byte. Digit 4
+// of qh[12] is not a trit: it is the third code value, which is why the code space
+// is 256*3. The mantissa stays raw. See docs/development/ptq1_1-format.md.
+#define QK_PTQ1_1 1024
+typedef struct {
+    uint8_t qs[8][24]; // 192 B, sub-block b at 24*b, 120 trits at 5 per byte
+    uint8_t qh[13];    //  13 B, 64 tail trits at 5 per byte; qh[12] digit 4 holds a code digit
+    uint8_t sc[11];    //  11 B, sc[0..9] = 8 x 10 bit mantissa, sc[10] = code high byte
+} block_ptq1_1;
+static_assert(sizeof(block_ptq1_1) == 216, "wrong ptq1_1 block size/padding");
 
 #define QK4_0 32
 typedef struct {

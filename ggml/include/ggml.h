@@ -434,7 +434,8 @@ extern "C" {
         // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        GGML_TYPE_PTQ1_1 = 144, // Prism-private ternary, super-block 1024, coded scale plane
+        GGML_TYPE_COUNT   = 145,
     };
 
     // precision
@@ -481,6 +482,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0 = 128, // except 1d tensors (Prism-private group-128 Q2_0)
         GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
+        GGML_FTYPE_MOSTLY_PTQ1_1 = 130, // except 1d tensors (Prism-private super-block-1024 ternary)
     };
 
     // available tensor operations:
