@@ -1355,6 +1355,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
 
+    // PTQ1_1 stores the 5 exponent bits of every scale in a model-wide pattern table.
+    // The table is not tensor data, so it arrives as metadata; a PTQ1_1 tensor cannot
+    // be decoded without it.
+    ml.get_arr("ptq1_1.codebook", ptq1_1_codebook, false);
+    if (!ptq1_1_codebook.empty() && ptq1_1_codebook.size() != 767u*5u) {
+        throw std::runtime_error(format("invalid ptq1_1.codebook length: %zu (expected %u)",
+            ptq1_1_codebook.size(), 767u*5u));
+    }
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 

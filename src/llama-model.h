@@ -719,6 +719,13 @@ struct llama_model {
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
+    // PTQ1_1 keeps the 5 exponent bits of each scale in a model-wide codebook: the 767
+    // most common 8-exponent patterns, 5 bytes each (5 bits per exponent, little endian).
+    // code 767 is the escape and is resolved from a per-tensor table instead.  The table
+    // cannot live in the tensor buffer because type_size is exact, so it arrives as GGUF
+    // metadata and is staged for the kernels separately.
+    std::vector<uint8_t> ptq1_1_codebook;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 
