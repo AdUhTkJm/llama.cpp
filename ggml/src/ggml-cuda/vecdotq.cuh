@@ -1046,6 +1046,125 @@ static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restr
 #endif
 }
 
+// PTQ1_1 x Q8_1. One call consumes the full 1024-weight super-block. patt points at the
+// 5-byte exponent pattern of this super-block, already resolved from the codebook (or the
+// escape list) by the launcher; iqs is the first of the 32 block_q8_1 it consumes. The
+// digit bias is folded into the exact per-32 integer activation sum, as in
+// vec_dot_ptq1_0_q8_1. Correctness reference first; the packed-trit fast path is a later
+// step and will take the standard (vbq, bq8_1, kbx, iqs) signature.
+static __device__ __forceinline__ float vec_dot_ptq1_1_q8_1_ref(const void * __restrict__ vbq,
+                                                                const block_q8_1 * __restrict__ bq8_1,
+                                                                const int & kbx,
+                                                                const int & iqs,
+                                                                const uint8_t * __restrict__ patt) {
+    const block_ptq1_1 * bq = (const block_ptq1_1 *) vbq + kbx;
+
+    float d[8];
+    for (int s = 0; s < 8; ++s) {
+        d[s] = ptq1_1_scale(bq, patt, s);
+    }
+
+    float acc = 0.0f;
+    for (int k = 0; k < 32; ++k) {
+        const block_q8_1 * y = bq8_1 + iqs + k;
+        int sumi = 0;
+        int isum = 0;
+        for (int i = 0; i < 32; ++i) {
+            const int q = (int) y->qs[i];
+            sumi += ptq1_1_digit_at(bq, 32*k + i) * q;
+            isum += q;
+        }
+        acc += d[k >> 2] * __low2float(y->ds) * (float) (sumi - isum);
+    }
+    return acc;
+}
+
+// Packed-trit PTQ1_1 x Q8_1 for one 1024-weight super-block on the plain AoS block_q8_1
+// layout. Same base-3 stepping as the PTQ1_0 dot, run once per 128-weight sub-block; the
+// 8 tail trits come from the pooled qh. Raw digits {0,1,2} go through dp4a and the exact
+// integer activation sum is subtracted per 32-block, so the -1 bias costs nothing. The
+// tables are resolved once per super-block: kbx is the absolute super-block index, which
+// is what the escape list is keyed on (see ptq1_1_pattern).
+static __device__ __forceinline__ float vec_dot_ptq1_1_q8_1(const void * __restrict__ vbq,
+                                                            const block_q8_1 * __restrict__ bq8_1,
+                                                            const int & kbx,
+                                                            const int & iqs,
+                                                            const uint8_t * __restrict__ codebook,
+                                                            const uint8_t * __restrict__ esc_patt,
+                                                            const uint32_t * __restrict__ esc_idx,
+                                                            const int n_esc) {
+    const block_ptq1_1 * bq   = (const block_ptq1_1 *) vbq + kbx;
+    const uint8_t *     patt  = ptq1_1_pattern(bq, kbx, codebook, esc_patt, esc_idx, n_esc);
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        const float d = ptq1_1_scale(bq, patt, s);
+        const block_q8_1 * y = bq8_1 + iqs + 4*s;
+
+        int sumi[4] = { 0, 0, 0, 0 };
+        int sumu[4] = { 0, 0, 0, 0 };
+
+        // qs[0..15]: four groups of four bytes, five trits each, element 16*t + 4*g + b
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const uint32_t packed = get_int_b4(bq->qs[s], g);
+            uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+            uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo                = w_lo & 0x00FF00FF;
+                v_hi                = w_hi & 0x00FF00FF;
+
+                const int q = __byte_perm(w_lo, w_hi, 0x7531);
+                const int e = t * 16 + 4 * g;
+                const int u = get_int_b4(y[e >> 5].qs, (e & 31) >> 2);
+                sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+                sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+            }
+        }
+
+        // qs[16..23]: two groups of four bytes, five trits each, element 80 + 8*t + 4*g + b
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const uint32_t packed = get_int_b4(bq->qs[s] + 16, g);
+            uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+            uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo                = w_lo & 0x00FF00FF;
+                v_hi                = w_hi & 0x00FF00FF;
+
+                const int q = __byte_perm(w_lo, w_hi, 0x7531);
+                const int e = 80 + t * 8 + 4 * g;
+                const int u = get_int_b4(y[e >> 5].qs, (e & 31) >> 2);
+                sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+                sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+            }
+        }
+
+        // tail trits: element 120 + k, pool position p = 8*s + k, chunk 3 / bytes 24..31
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int p = 8*s + k;
+            const int q = ptq1_1_digit(bq->qh[p / 5], p % 5);
+            const int u = (int) y[3].qs[24 + k];
+            sumi[3] += q * u;
+            sumu[3] += u;
+        }
+
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            acc += d * __low2float(y[c].ds) * (float) (sumi[c] - sumu[c]);
+        }
+    }
+    return acc;
+}
+
 static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restrict__ vbq,
                                                            const block_q8_1 * __restrict__ bq8_1,
                                                            const int & kbx,

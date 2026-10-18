@@ -11,6 +11,26 @@
 // ---- CUDA intrinsic stubs -------------------------------------------------
 struct half2_stub { float lo, hi; };
 static inline float __low2float(half2_stub h) { return h.lo; }
+static inline int ggml_cuda_dp4a(int a, int b, int c) {
+    const int8_t * pa = (const int8_t *) &a;
+    const int8_t * pb = (const int8_t *) &b;
+    return c + pa[0]*pb[0] + pa[1]*pb[1] + pa[2]*pb[2] + pa[3]*pb[3];
+}
+static inline uint32_t __byte_perm(uint32_t a, uint32_t b, uint32_t s) {
+    uint32_t r = 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t sel = (s >> (4*i)) & 7;
+        const uint32_t byte = (sel & 4) ? (b >> (8*(sel & 3))) : (a >> (8*(sel & 3)));
+        r |= (byte & 0xFFu) << (8*i);
+    }
+    return r;
+}
+static inline int get_int_b4(const int8_t * qs, int j) {
+    int v; memcpy(&v, qs + j*4, 4); return v;
+}
+static inline int get_int_b4_u8(const uint8_t * x, int j) {
+    int v; memcpy(&v, x + j*4, 4); return v;
+}
 
 #define QK8_1 32
 struct block_q8_1 { half2_stub ds; int8_t qs[QK8_1]; };
@@ -117,6 +137,94 @@ static inline float vec_dot_ptq1_1_q8_1_ref(const void * vbq, const block_q8_1 *
             isum += q;
         }
         acc += d[k >> 2] * __low2float(y->ds) * (float) (sumi - isum);
+    }
+    return acc;
+}
+
+// ---- transcribed verbatim from ggml-cuda/common.cuh (pattern resolver) ---
+static inline const uint8_t * ptq1_1_pattern(const block_ptq1_1 * x, const int sb,
+                                             const uint8_t * codebook, const uint8_t * esc_patt,
+                                             const uint32_t * esc_idx, const int n_esc) {
+    const int code = ptq1_1_code(x);
+    if (code < 767) {
+        return codebook + 5*code;
+    }
+    int lo = 0;
+    int hi = n_esc;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if ((int) esc_idx[mid] < sb) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return esc_patt + 5*lo;
+}
+
+// ---- transcribed verbatim from ggml-cuda/vecdotq.cuh (packed dot) --------
+static inline float vec_dot_ptq1_1_q8_1(const void * vbq, const block_q8_1 * bq8_1,
+                                        const int kbx, const int iqs,
+                                        const uint8_t * codebook, const uint8_t * esc_patt,
+                                        const uint32_t * esc_idx, const int n_esc) {
+    const block_ptq1_1 * bq   = (const block_ptq1_1 *) vbq + kbx;
+    const uint8_t *     patt  = ptq1_1_pattern(bq, kbx, codebook, esc_patt, esc_idx, n_esc);
+
+    float acc = 0.0f;
+    for (int s = 0; s < 8; ++s) {
+        const float d = ptq1_1_scale(bq, patt, s);
+        const block_q8_1 * y = bq8_1 + iqs + 4*s;
+
+        int sumi[4] = { 0, 0, 0, 0 };
+        int sumu[4] = { 0, 0, 0, 0 };
+
+        for (int g = 0; g < 4; ++g) {
+            const uint32_t packed = (uint32_t) get_int_b4_u8(bq->qs[s], g);
+            uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+            uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo                = w_lo & 0x00FF00FF;
+                v_hi                = w_hi & 0x00FF00FF;
+
+                const int q = (int) __byte_perm(w_lo, w_hi, 0x7531);
+                const int e = t * 16 + 4 * g;
+                const int u = get_int_b4(y[e >> 5].qs, (e & 31) >> 2);
+                sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+                sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+            }
+        }
+
+        for (int g = 0; g < 2; ++g) {
+            const uint32_t packed = (uint32_t) get_int_b4_u8(bq->qs[s] + 16, g);
+            uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
+            uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo                = w_lo & 0x00FF00FF;
+                v_hi                = w_hi & 0x00FF00FF;
+
+                const int q = (int) __byte_perm(w_lo, w_hi, 0x7531);
+                const int e = 80 + t * 8 + 4 * g;
+                const int u = get_int_b4(y[e >> 5].qs, (e & 31) >> 2);
+                sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+                sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+            }
+        }
+
+        for (int k = 0; k < 8; ++k) {
+            const int p = 8*s + k;
+            const int q = ptq1_1_digit(bq->qh[p / 5], p % 5);
+            const int u = (int) y[3].qs[24 + k];
+            sumi[3] += q * u;
+            sumu[3] += u;
+        }
+
+        for (int c = 0; c < 4; ++c) {
+            acc += d * __low2float(y[c].ds) * (float) (sumi[c] - sumu[c]);
+        }
     }
     return acc;
 }
@@ -294,12 +402,88 @@ int main(void) {
         }
     }
 
+    // 4. packed dot vs the reference dot, at several codes plus the escape path.
+    // The packed dot resolves the pattern itself from the codebook/escape, so this also
+    // checks the resolver and the dp4a trit walk against the straightforward decode.
+    long packed_checks = 0, packed_bad = 0;
+    double packed_worst = 0.0;
+    static uint8_t  codebook[767*5];
+    static uint8_t  esc_patt[5];
+    static uint32_t esc_idx[1];
+    for (size_t i = 0; i < sizeof(codebook); ++i) {
+        codebook[i] = (uint8_t) rnd();
+    }
+    const int codes[5] = { 0, 1, 300, 766, 767 };
+    for (int ci = 0; ci < 5; ++ci) {
+        const int code = codes[ci];
+        for (int trial = 0; trial < 2000; ++trial) {
+            block_ptq1_1 w;
+            for (int b = 0; b < 8; ++b) {
+                for (int i = 0; i < 24; ++i) {
+                    w.qs[b][i] = (uint8_t) rnd();
+                }
+            }
+            for (int i = 0; i < 13; ++i) {
+                w.qh[i] = (uint8_t) rnd();
+            }
+            for (int i = 0; i < 11; ++i) {
+                w.sc[i] = (uint8_t) rnd();
+            }
+
+            uint8_t patt[5];
+            for (int i = 0; i < 5; ++i) {
+                patt[i] = (uint8_t) rnd();
+            }
+
+            // force the code; qh[12] digit 4 carries code % 3 and no trit uses it
+            w.sc[10] = (uint8_t) (code / 3);
+            for (int v = 0; v < 256; ++v) {
+                if (ptq1_1_digit((uint8_t) v, 4) == code % 3) {
+                    w.qh[12] = (uint8_t) v;
+                    break;
+                }
+            }
+            if (code < 767) {
+                memcpy(codebook + 5*code, patt, 5);
+            } else {
+                esc_idx[0] = 0;
+                memcpy(esc_patt, patt, 5);
+            }
+
+            block_q8_1 y[32];
+            for (int k = 0; k < 32; ++k) {
+                y[k].ds.lo = 0.005f + (rnd() % 1000) / 80000.0f;
+                y[k].ds.hi = 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    y[k].qs[i] = (int8_t) ((int) (rnd() % 255) - 127);
+                }
+            }
+
+            const float ref = vec_dot_ptq1_1_q8_1_ref(&w, y, 0, 0, patt);
+            const float got = vec_dot_ptq1_1_q8_1(&w, y, 0, 0, codebook, esc_patt, esc_idx, 1);
+            ++packed_checks;
+            const double e = fabs((double) got - ref) / fmax(1.0, fabs((double) ref));
+            if (e > packed_worst) {
+                packed_worst = e;
+            }
+            if (e > 1e-5) {
+                if (packed_bad < 5) {
+                    printf("  PACKED MISMATCH code=%d trial %d: ref %.9g got %.9g\n",
+                           code, trial, (double) ref, (double) got);
+                }
+                ++packed_bad;
+            }
+        }
+    }
+
     printf("  element map : %ld checks, %ld mismatches\n", total, bad);
     printf("  tail sweep  : %ld checks, %ld mismatches\n", tail_checks, tail_bad);
     printf("  scale decode: %ld checks, %ld mismatches\n", scale_checks, scale_bad);
     printf("  dot products: %ld checks, %ld bad  (worst err / sum|terms| = %.3e)\n",
            dot_checks, dot_bad, worst_scaled);
-    const long all_bad = bad + tail_bad + scale_bad + dot_bad;
+    printf("  packed dot  : %ld checks, %ld bad  (worst rel err vs ref = %.3e)\n",
+           packed_checks, packed_bad, packed_worst);
+    const long all_bad = bad + tail_bad + scale_bad + dot_bad + packed_bad;
     printf("  %s\n", all_bad == 0 ? "PTQ1_1 decode MATCHES the CPU codec"
                                   : "PTQ1_1 decode BUG");
     return all_bad != 0;

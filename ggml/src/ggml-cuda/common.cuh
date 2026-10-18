@@ -1115,6 +1115,30 @@ static __device__ __forceinline__ float ptq1_1_scale(const block_ptq1_1 * x, con
     return __half2float(__ushort_as_half(bits));
 }
 
+// 5-byte exponent pattern of a super-block. code < 767 indexes the model-wide codebook;
+// 767 is the escape, resolved by binary search over the per-tensor list (sorted by
+// super-block index sb, one 5-byte pattern per entry). The codebook pointer is the
+// handle a kernel gets for its weight tensor.
+static __device__ __forceinline__ const uint8_t * ptq1_1_pattern(
+        const block_ptq1_1 * x, const int sb, const uint8_t * codebook,
+        const uint8_t * esc_patt, const uint32_t * esc_idx, const int n_esc) {
+    const int code = ptq1_1_code(x);
+    if (code < 767) {
+        return codebook + 5*code;
+    }
+    int lo = 0;
+    int hi = n_esc;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if ((int) esc_idx[mid] < sb) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return esc_patt + 5*lo;
+}
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_1> {
     static constexpr int qk = QK_PTQ1_1;
