@@ -1048,6 +1048,80 @@ struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
     static constexpr int qi = QI_PTQ1_0;
 };
 
+// PTQ1_1 is a PTQ1_0 super-block of 1024 weights. The 24 qs bytes of each 128-weight
+// sub-block are unchanged, so the trit walk inside a sub-block is the same; the 8 tail
+// trits of the eight sub-blocks are pooled at 5 per byte in qh, and the fp16 scale of a
+// sub-block is one shared 8-exponent pattern (5 bits each) plus a raw 10-bit mantissa.
+// The pattern, its codebook and the escape list are model data, see
+// docs/development/ptq1_1-format.md.
+static __device__ __forceinline__ int ptq1_1_digit(const uint8_t byte, const int n) {
+    uint32_t v = byte;
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        if (i < n) {
+            v = (v * 3) & 0xFF;
+        }
+    }
+    return (int) ((v * 3) >> 8);
+}
+
+// raw digit {0,1,2} of element e in [0, QK_PTQ1_1); sub-block b = e/128
+static __device__ __forceinline__ int ptq1_1_digit_at(const block_ptq1_1 * x, const int e) {
+    const int b = e >> 7;
+    const int r = e & 127;
+    if (r < 80) {
+        return ptq1_1_digit(x->qs[b][r & 15], r >> 4);
+    }
+    if (r < 120) {
+        const int t = r - 80;
+        return ptq1_1_digit(x->qs[b][16 + (t & 7)], t >> 3);
+    }
+    const int p = 8*b + (r - 120);
+    return ptq1_1_digit(x->qh[p / 5], p % 5);
+}
+
+// sc[10] holds the high part of the code, digit 4 of qh[12] the base-3 low part
+static __device__ __forceinline__ int ptq1_1_code(const block_ptq1_1 * x) {
+    return (int) x->sc[10]*3 + ptq1_1_digit(x->qh[12], 4);
+}
+
+// exponent s (0..7) of a pattern, 5 bits each, little endian in 5 bytes
+static __device__ __forceinline__ int ptq1_1_pattern_exp(const uint8_t * patt, const int s) {
+    uint64_t v = 0;
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        v |= (uint64_t) patt[i] << (8*i);
+    }
+    return (int) ((v >> (5*s)) & 0x1F);
+}
+
+// mantissa of sub-block s, 10 bits at bit 10*s of sc[0..9]
+static __device__ __forceinline__ int ptq1_1_mantissa(const block_ptq1_1 * x, const int s) {
+    const int byte = (10*s) >> 3;
+    const int off  = (10*s) & 7;
+    uint32_t v = 0;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        if (byte + i < 10) {
+            v |= (uint32_t) x->sc[byte + i] << (8*i);
+        }
+    }
+    return (int) ((v >> off) & 0x3FF);
+}
+
+// fp16 scale of sub-block s; the format stores no sign, the exponent field is 5 bits
+static __device__ __forceinline__ float ptq1_1_scale(const block_ptq1_1 * x, const uint8_t * patt, const int s) {
+    const uint16_t bits = (uint16_t) ((ptq1_1_pattern_exp(patt, s) << 10) | ptq1_1_mantissa(x, s));
+    return __half2float(__ushort_as_half(bits));
+}
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_1> {
+    static constexpr int qk = QK_PTQ1_1;
+    static constexpr int qr = QR_PTQ1_1;
+    static constexpr int qi = QI_PTQ1_1;
+};
+
 // Activation (src1) q8_1 layouts produced by quantize_row_q8_1_cuda and consumed by the MMVQ kernels.
 // Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are valid
 // for all three; only the byte order inside a column differs.
