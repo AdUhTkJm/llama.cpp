@@ -1,6 +1,7 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include "ptq1_1-tables.cuh"
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -191,6 +192,82 @@ static void get_rows_cuda_q(
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
         s10, s11, s12/*, s13*/);
+}
+
+// PTQ1_1 needs the model-wide codebook and the tensor's escape list to decode a scale
+// pattern, so it cannot use the fixed-signature dequantize_kernel of k_get_rows.
+template<typename dst_t>
+static __global__ void k_get_rows_ptq1_1(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,
+        const uint8_t * __restrict__ codebook,
+        const uint8_t * __restrict__ esc_patt,
+        const uint32_t * __restrict__ esc_idx,
+        const int n_esc) {
+
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        const size_t row_off = i01*nb01 + i11*nb02 + i12*nb03;
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const char * src0_row = (const char *) src0 + row_off;
+        // the escape list is keyed by the flat super-block index over the whole tensor
+        const int64_t sb_row = row_off / sizeof(block_ptq1_1);
+
+        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+            const int64_t sb = i00 / QK_PTQ1_1;
+            const int      e  = (int) (i00 - sb*QK_PTQ1_1);
+            const block_ptq1_1 * b = (const block_ptq1_1 *) src0_row + sb;
+
+            const uint8_t * patt = ptq1_1_pattern(b, sb_row + sb, codebook, esc_patt, esc_idx, n_esc);
+            const float     d    = ptq1_1_scale(b, patt, e >> 7);
+
+            dst_row[i00] = ggml_cuda_cast<dst_t>((ptq1_1_digit_at(b, e) - 1) * d);
+        }
+    }
+}
+
+template<typename dst_t>
+static void get_rows_cuda_ptq1_1(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        const ptq1_1_tables & t, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_PTQ1_1 == 0);
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_ptq1_1<dst_t><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d,
+        ne00, ne11, ne12_fdv,
+        s1, s2, s3,
+        nb01, nb02, nb03,
+        s10, s11, s12,
+        t.codebook, t.esc_patt, t.esc_idx, t.n_esc);
 }
 
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
@@ -461,6 +538,28 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+#if !defined(GGML_USE_HIP)
+    if (src0->type == GGML_TYPE_PTQ1_1) {
+        const ptq1_1_tables t = ptq1_1_tables_get(src0, ggml_cuda_get_device());
+        switch (dst->type) {
+            case GGML_TYPE_F32:
+                get_rows_cuda_ptq1_1<float>(src0->data, (const int32_t *) src1->data, (float *) dst->data,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, t, stream);
+                return;
+            case GGML_TYPE_F16:
+                get_rows_cuda_ptq1_1<half>(src0->data, (const int32_t *) src1->data, (half *) dst->data,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, t, stream);
+                return;
+            case GGML_TYPE_BF16:
+                get_rows_cuda_ptq1_1<nv_bfloat16>(src0->data, (const int32_t *) src1->data, (nv_bfloat16 *) dst->data,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, t, stream);
+                return;
+            default:
+                GGML_ABORT("%s: unsupported dst type for PTQ1_1: %s\n", __func__, ggml_type_name(dst->type));
+        }
+    }
+#endif
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

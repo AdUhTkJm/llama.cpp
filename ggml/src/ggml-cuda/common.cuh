@@ -1120,7 +1120,7 @@ static __device__ __forceinline__ float ptq1_1_scale(const block_ptq1_1 * x, con
 // super-block index sb, one 5-byte pattern per entry). The codebook pointer is the
 // handle a kernel gets for its weight tensor.
 static __device__ __forceinline__ const uint8_t * ptq1_1_pattern(
-        const block_ptq1_1 * x, const int sb, const uint8_t * codebook,
+        const block_ptq1_1 * x, const int64_t sb, const uint8_t * codebook,
         const uint8_t * esc_patt, const uint32_t * esc_idx, const int n_esc) {
     const int code = ptq1_1_code(x);
     if (code < 767) {
@@ -1130,11 +1130,15 @@ static __device__ __forceinline__ const uint8_t * ptq1_1_pattern(
     int hi = n_esc;
     while (lo < hi) {
         const int mid = (lo + hi) >> 1;
-        if ((int) esc_idx[mid] < sb) {
+        if ((int64_t) esc_idx[mid] < sb) {
             lo = mid + 1;
         } else {
             hi = mid;
         }
+    }
+    if (lo >= n_esc) {
+        // corrupt input; keep the read in bounds instead of walking off the list
+        lo = n_esc > 0 ? n_esc - 1 : 0;
     }
     return esc_patt + 5*lo;
 }

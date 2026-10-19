@@ -325,6 +325,7 @@ namespace GGUFMeta {
         bool type_ok = false;
         switch (arr_info.gt) {
             case GGUF_TYPE_UINT8:   type_ok = (std::is_same<T,     uint8_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
                                               (std::is_same<T,    uint32_t>::value); break;
@@ -415,6 +416,7 @@ namespace GGUFMeta {
 
     template bool llama_model_loader::get_arr<std::string>(const std::string & key, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<uint8_t>(const std::string & key, std::vector<uint8_t> & result, bool required);
+    template bool llama_model_loader::get_arr<uint64_t>(const std::string & key, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);

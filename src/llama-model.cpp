@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-quants.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1840,6 +1841,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (arch == LLM_ARCH_DSPARK && params.dspark_head_source) {
         tensors_by_name.emplace_back("output.weight", output);
+    }
+
+    {
+        bool has_ptq1_1 = false;
+        for (const auto & [_, tensor] : tensors_by_name) {
+            has_ptq1_1 = has_ptq1_1 || tensor->type == GGML_TYPE_PTQ1_1;
+        }
+        if (has_ptq1_1 && ptq1_1_codebook.empty()) {
+            throw std::runtime_error("PTQ1_1 tensors need ptq1_1.codebook metadata");
+        }
+        if (has_ptq1_1) {
+            ggml_ptq1_1_set_codebook(ptq1_1_codebook.data());
+        }
+        for (const auto & [name, tensor] : tensors_by_name) {
+            if (tensor->type != GGML_TYPE_PTQ1_1) {
+                continue;
+            }
+            std::vector<uint64_t> escapes;
+            ml.get_arr("ptq1_1.escape." + name, escapes, false);
+            ggml_ptq1_1_set_escape(tensor, ptq1_1_codebook.data(), escapes.data(), (int64_t) escapes.size());
+        }
     }
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);

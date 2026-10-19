@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-quants.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -4897,6 +4898,56 @@ static void ggml_compute_forward_get_rows_q(
     }
 }
 
+static void ggml_compute_forward_get_rows_ptq1_1(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    const uint8_t  * codebook = NULL;
+    const uint64_t * esc      = NULL;
+    int64_t          n_esc    = 0;
+    if (!ggml_ptq1_1_get_escape(src0, &codebook, &esc, &n_esc)) {
+        GGML_ABORT("%s: no PTQ1_1 pattern tables for tensor '%s'", __func__, src0->name);
+    }
+
+    assert(ne0  == nc);
+    assert(ne02 == ne11);
+    assert(nb00 == ggml_type_size(src0->type));
+    assert(ggml_nrows(dst) == nr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        const size_t off = i01*nb01 + i11*nb02 + i12*nb03;
+        dequantize_row_ptq1_1_esc(
+                (const block_ptq1_1 *) ((const char *) src0->data + off),
+                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc,
+                codebook, esc, n_esc, (int64_t) (off / sizeof(block_ptq1_1)));
+    }
+}
+
 static void ggml_compute_forward_get_rows_f16(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -5057,6 +5108,10 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ2_S:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
+            } break;
+        case GGML_TYPE_PTQ1_1:
+            {
+                ggml_compute_forward_get_rows_ptq1_1(params, dst);
             } break;
         case GGML_TYPE_F16:
             {

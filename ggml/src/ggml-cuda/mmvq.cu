@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-ptq1_0.cuh"
+#include "mmvq-ptq1_1.cuh"
 #include "mmvq-pq2_0.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -297,6 +298,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         return false;
     }
 #if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_1) {
+        // Only path for PTQ1_1: no MMQ tile loader and no cuBLAS convert function.
+        // The plain 2D mat-vec handles any column count, chunked in groups of 8.
+        return true;
+    }
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0
         // MMQ tile loader the tile path overtakes it at 5+ columns on Ada (RTX 4070, Bonsai 2 27B:
@@ -1430,7 +1436,22 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, cudaStream_t stream) {
+        const int ids_stride, const ggml_cuda_q8_1_layout y_layout, const int64_t sb_row_base,
+        const ggml_tensor * src0, cudaStream_t stream) {
+#if !defined(GGML_USE_HIP)
+    if (type_x == GGML_TYPE_PTQ1_1) {
+        // MUL_MAT_ID is not supported: the escape list cannot be resolved from the ids.
+        // The launcher chunks the columns in groups of 8, so ncols_dst is not limited.
+        GGML_ASSERT(!ids && y_layout == GGML_CUDA_Q8_1_AOS);
+        const ptq1_1_tables t = ptq1_1_tables_get(src0, ggml_cuda_get_device());
+        mul_mat_vec_ptq1_1_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst,
+                                  stride_row_x, stride_col_y, stride_col_dst,
+                                  nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                                  sb_row_base, t, stream);
+        return;
+    }
+#endif
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
@@ -1718,7 +1739,7 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, 0, src0, stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
@@ -1748,7 +1769,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) src1_ncols, false);
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, y_layout, stream);
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, y_layout, row_low, src0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }

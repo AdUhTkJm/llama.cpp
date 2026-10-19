@@ -1793,6 +1793,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // PTQ1_1 takes the dedicated mat-vec with no fusion arguments; adding them is a later step.
+    if (src0->type == GGML_TYPE_PTQ1_1) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -5656,6 +5661,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_PTQ1_0:
+#if !defined(GGML_USE_HIP)
+                    case GGML_TYPE_PTQ1_1:
+                        // No MMQ tile loader and no cuBLAS convert function, so the dedicated
+                        // mat-vec is the only path. It handles channels and samples but not ids.
+                        return op->op == GGML_OP_MUL_MAT;
+#endif
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -5697,6 +5708,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q2_0:
                     case GGML_TYPE_PQ2_0:
                     case GGML_TYPE_PTQ1_0:
+#if !defined(GGML_USE_HIP)
+                    case GGML_TYPE_PTQ1_1:
+#endif
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

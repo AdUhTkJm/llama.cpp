@@ -204,6 +204,34 @@ tensor buffer, because `type_size` is exact.
 `ggml_tensor.extra` is free on CUDA (`ggml-zdnn` uses it, nothing else does) and
 is the natural place for the per-tensor record.
 
+### What was built
+
+`ggml_tensor.extra` is left alone. The loader registers both tables in `ggml-base`
+keyed by tensor instead, which keeps the handles in one place and lets the CPU
+code read them too:
+
+- `ggml_ptq1_1_set_codebook()` installs the model-wide table, process level, as
+  `dequantize_row_ptq1_1` needs it. One PTQ1_1 model per process.
+- `ggml_ptq1_1_set_escape(tensor, codebook, esc, n_esc)` records the 8-byte
+  escapes of one tensor, packed `(sb << 40) | pattern`, sorted by `sb`. The loader
+  calls it for every PTQ1_1 tensor, including the 236 with an empty list, so a
+  recycled tensor address cannot read a stale list.
+- `dequantize_row_ptq1_1_esc()` takes the tables and the flat super-block index
+  of the first block, so CPU `GET_ROWS` decodes escapes correctly. The CUDA
+  `get_rows` kernel does the same with the table pointers.
+- CUDA mat-vec and mat-mul call `ptq1_1_tables_get()`, which keeps a device copy
+  per (tensor, device), the same shape as `get_dense_w()`.
+
+CPU `MUL_MAT` refuses PTQ1_1 in `ggml_backend_cpu_device_supports_op`: a
+`vec_dot` sees only the block pointer, so it cannot resolve an escape. The type is
+CUDA only for matrix products, which is what section 8 predicted. CPU `GET_ROWS`
+stays available, so a model with the embedding matrix on the host still runs.
+
+`to_float` (`dequantize_row_ptq1_1`) has the same blind spot: it uses the process
+codebook and aborts if it meets code 767. Nothing calls it on a PTQ1_1 tensor in
+the load and run paths. It would only be reached by an explicit f32 conversion of
+a quantized weight.
+
 ## 9. Verification
 
 The first milestone is a round-trip check, before any kernel work.
@@ -213,7 +241,7 @@ The first milestone is a round-trip check, before any kernel work.
 2. Compare the raw scale bits: `(exp << 10) | mant` from the decoded code must
    equal the original fp16 `d` bits, all 16 of them, for every block.
 3. Compare the trits: element by element, all 128 per block, as {-1, 0, 1}.
-4. Check the escape path on the 3,282 super-blocks that need it.
+4. Check the escape path on the 3,299 super-blocks that need it.
 5. Check the size: `ggml_row_size(GGML_TYPE_PTQ1_1, 5120) == 1080`.
 
 Status: steps 1 to 5 pass on the full model, using
@@ -221,6 +249,17 @@ Status: steps 1 to 5 pass on the full model, using
 escapes, every trit and all 16 scale bits identical. 5,877,760,000 bytes become
 5,667,840,000, 3.571% smaller. Registration through `ggml` gives
 `blck_size 1024`, `type_size 216`, `row_size(5120) = 1080`.
+
+Cross-check against the C decoder, on the two files in `~/.local/models`: decode
+`blk.0.ssm_out.weight`, `output.weight` and `blk.0.attn_gate.weight` from both
+files, with the codebook and the escape lists read from the GGUF. All trits and
+all 16 scale bits per block are identical, and the escape lists cover exactly the
+blocks that carry code 767. On the model: `llama-perplexity` over 3 chunks gives
+7.6513, 7.6133, 7.9411 against PTQ1_0's 7.6629, 7.6232, 7.9478, and 128
+tokens of greedy output are identical. The difference comes from PTQ1_0 using the
+int8 MMQ tile path and PTQ1_1 the dp4a mat-vec, not from the weight bytes. Running
+the embedding matrix on the host instead of the device reproduces the CUDA
+numbers to the last digit, which covers the escape path on both sides.
 
 ## 10. Plumbing
 
@@ -246,6 +285,23 @@ converter does not use it, so return 0 and leave `from_float_ref` unset.
 Kernels, after the round-trip passes: `vec_dot_ptq1_0_q8_1_multi`,
 `ptq1_0_pt_block_dot`, `ggml_cuda_mmq_load_tiles_ptq1_0`, `convert.cu` /
 `getrows.cu`. These are the four consumers of `block_ptq1_0`.
+
+Done since: `getrows.cu` (`k_get_rows_ptq1_1`), a dedicated
+`mul_mat_vec_ptq1_1` in `ggml/src/ggml-cuda/mmvq-ptq1_1.cuh` with the packed
+trit dot `vec_dot_ptq1_1_q8_1_patt`, and the CPU `GET_ROWS` path. The kernel
+handles channels and samples, chunks wide batches in groups of 8, and does not
+support `MUL_MAT_ID` (weights for MoE experts would need the escape list indexed
+by expert).
+
+Still open: the MMQ tile loader, `convert.cu`, and the two PTQ1_0 fast paths
+(`vec_dot_ptq1_0_q8_1_multi`, `ptq1_0_pt_block_dot`) adapted to PTQ1_1. On an
+RTX 4060 Laptop with the 27B model that gap is pp512 41.7 t/s and tg128 16.5 t/s
+against PTQ1_0's 510 t/s and 35.8 t/s.
+
+One loose end: the file records `general.file_type = 130`, which is the `ggml.h`
+number, while `llama.h` uses 144 for the same format and the PTQ1_0 file carries
+143. The load log therefore prints `unknown, may not work`. Nothing reads the
+value beyond that name.
 
 ## 11. Rejected designs
 

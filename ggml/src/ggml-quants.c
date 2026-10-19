@@ -12,6 +12,7 @@
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+#include <inttypes.h>
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -2294,6 +2295,109 @@ void ggml_ptq1_1_set_codebook(const uint8_t * codebook) {
     ptq1_1_codebook = codebook;
 }
 
+// Per-tensor escape lists, keyed by tensor name. The loader fills one entry for every
+// PTQ1_1 tensor, including empty lists, so a recycled tensor never reads a stale list.
+struct ptq1_1_escape_entry {
+    char * name;
+    const uint8_t * codebook;
+    uint64_t * esc;
+    int64_t n_esc;
+};
+
+static struct ptq1_1_escape_entry * ptq1_1_escapes = NULL;
+static int64_t ptq1_1_n_escapes = 0;
+static int64_t ptq1_1_cap_escapes = 0;
+
+// The scheduler copies a weight it needs on another backend and names the copy
+// "<backend>#<name>#<n>". Strip that, so a copy resolves to the tables of the tensor
+// it was made from.
+static const char * ptq1_1_base_name(const char * name, char * buf, size_t size) {
+    const char * first = strchr(name, '#');
+    const char * last  = strrchr(name, '#');
+    if (first == NULL || last == first || (size_t) (last - first) > size) {
+        return name;
+    }
+    const size_t len = (size_t) (last - first - 1);
+    memcpy(buf, first + 1, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static struct ptq1_1_escape_entry * ptq1_1_find_escape(const char * name) {
+    char buf[GGML_MAX_NAME];
+    const char * base = ptq1_1_base_name(name, buf, sizeof(buf));
+    for (int64_t i = 0; i < ptq1_1_n_escapes; ++i) {
+        if (strcmp(ptq1_1_escapes[i].name, base) == 0) {
+            return &ptq1_1_escapes[i];
+        }
+    }
+    return NULL;
+}
+
+void ggml_ptq1_1_set_escape(const struct ggml_tensor * tensor, const uint8_t * codebook,
+                            const uint64_t * esc, int64_t n_esc) {
+    if (tensor == NULL || n_esc < 0 || (n_esc > 0 && esc == NULL)) {
+        GGML_ABORT("ptq1_1: invalid escape list");
+    }
+
+    struct ptq1_1_escape_entry * e = ptq1_1_find_escape(tensor->name);
+    if (e == NULL) {
+        if (ptq1_1_n_escapes == ptq1_1_cap_escapes) {
+            const int64_t cap = ptq1_1_cap_escapes ? 2*ptq1_1_cap_escapes : 64;
+            void * p = realloc(ptq1_1_escapes, (size_t) cap * sizeof(*ptq1_1_escapes));
+            if (p == NULL) {
+                GGML_ABORT("ptq1_1: out of memory for escape registry");
+            }
+            ptq1_1_escapes = (struct ptq1_1_escape_entry *) p;
+            ptq1_1_cap_escapes = cap;
+        }
+        e = &ptq1_1_escapes[ptq1_1_n_escapes++];
+        e->name   = NULL;
+        e->esc    = NULL;
+        e->n_esc  = 0;
+    }
+
+    uint64_t * copy = NULL;
+    if (n_esc > 0) {
+        copy = (uint64_t *) malloc((size_t) n_esc * sizeof(uint64_t));
+        if (copy == NULL) {
+            GGML_ABORT("ptq1_1: out of memory for escape list");
+        }
+        memcpy(copy, esc, (size_t) n_esc * sizeof(uint64_t));
+    }
+
+    if (e->name == NULL) {
+        char buf[GGML_MAX_NAME];
+        const char * base = ptq1_1_base_name(tensor->name, buf, sizeof(buf));
+        const size_t len = strlen(base);
+        e->name = (char *) malloc(len + 1);
+        if (e->name == NULL) {
+            GGML_ABORT("ptq1_1: out of memory for escape registry");
+        }
+        memcpy(e->name, base, len + 1);
+    }
+
+    free(e->esc);
+    e->esc      = copy;
+    e->n_esc    = n_esc;
+    e->codebook = codebook;
+}
+
+bool ggml_ptq1_1_get_escape(const struct ggml_tensor * tensor, const uint8_t ** codebook,
+                            const uint64_t ** esc, int64_t * n_esc) {
+    if (tensor == NULL) {
+        return false;
+    }
+    const struct ptq1_1_escape_entry * e = ptq1_1_find_escape(tensor->name);
+    if (e == NULL) {
+        return false;
+    }
+    if (codebook) { *codebook = e->codebook; }
+    if (esc)      { *esc      = e->esc;      }
+    if (n_esc)    { *n_esc    = e->n_esc;    }
+    return true;
+}
+
 static const uint8_t ptq1_1_pow3[5] = {1, 3, 9, 27, 81};
 
 // one base-3 digit of a 5-trit byte, same expression as dequantize_row_ptq1_0
@@ -2324,18 +2428,51 @@ static inline uint32_t ptq1_1_mantissa(const uint8_t * sc, const int s) {
 void dequantize_row_ptq1_1(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_PTQ1_1 == 0);
     assert(ptq1_1_codebook != NULL);
+    dequantize_row_ptq1_1_esc(x, y, k, ptq1_1_codebook, NULL, 0, 0);
+}
+
+// pattern of super-block sb: codebook code, or the tensor's escape list
+static inline void ptq1_1_pattern_bytes(const block_ptq1_1 * b, const int64_t sb,
+                                        const uint8_t * codebook, const uint64_t * esc, const int64_t n_esc,
+                                        uint8_t patt[5]) {
+    const int code = b->sc[10]*3 + ptq1_1_digit(b->qh[12], 4);
+    if (code < 767) {
+        memcpy(patt, codebook + 5*code, 5);
+        return;
+    }
+
+    int64_t lo = 0;
+    int64_t hi = n_esc;
+    while (lo < hi) {
+        const int64_t mid = (lo + hi)/2;
+        if ((int64_t) (esc[mid] >> 40) < sb) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= n_esc || (int64_t) (esc[lo] >> 40) != sb) {
+        GGML_ABORT("ptq1_1: escape super-block %" PRId64 " not in the table", sb);
+    }
+
+    const uint64_t v = esc[lo] & (((uint64_t) 1 << 40) - 1);
+    for (int i = 0; i < 5; ++i) {
+        patt[i] = (uint8_t) (v >> (8*i));
+    }
+}
+
+void dequantize_row_ptq1_1_esc(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k,
+                               const uint8_t * codebook, const uint64_t * esc, int64_t n_esc,
+                               int64_t sb_base) {
+    assert(k % QK_PTQ1_1 == 0);
+    assert(codebook != NULL);
     const int64_t nb = k / QK_PTQ1_1;
 
     for (int64_t i = 0; i < nb; ++i) {
         const block_ptq1_1 * b = x + i;
 
-        const int code = b->sc[10]*3 + ptq1_1_digit(b->qh[12], 4);
-        // the escape pattern is per super-block, so it cannot be resolved from the
-        // block pointer alone; only the loader knows the table
-        if (code >= 767) {
-            GGML_ABORT("ptq1_1: escape code in the reference dequantizer");
-        }
-        const uint8_t * patt = ptq1_1_codebook + 5*code;
+        uint8_t patt[5];
+        ptq1_1_pattern_bytes(b, sb_base + i, codebook, esc, n_esc, patt);
 
         for (int s = 0; s < 8; ++s) {
             const uint16_t bits = (uint16_t) ((ptq1_1_pattern_exp(patt, s) << 10) | ptq1_1_mantissa(b->sc, s));

@@ -1083,19 +1083,11 @@ static __device__ __forceinline__ float vec_dot_ptq1_1_q8_1_ref(const void * __r
 // layout. Same base-3 stepping as the PTQ1_0 dot, run once per 128-weight sub-block; the
 // 8 tail trits come from the pooled qh. Raw digits {0,1,2} go through dp4a and the exact
 // integer activation sum is subtracted per 32-block, so the -1 bias costs nothing. The
-// tables are resolved once per super-block: kbx is the absolute super-block index, which
-// is what the escape list is keyed on (see ptq1_1_pattern).
-static __device__ __forceinline__ float vec_dot_ptq1_1_q8_1(const void * __restrict__ vbq,
-                                                            const block_q8_1 * __restrict__ bq8_1,
-                                                            const int & kbx,
-                                                            const int & iqs,
-                                                            const uint8_t * __restrict__ codebook,
-                                                            const uint8_t * __restrict__ esc_patt,
-                                                            const uint32_t * __restrict__ esc_idx,
-                                                            const int n_esc) {
-    const block_ptq1_1 * bq   = (const block_ptq1_1 *) vbq + kbx;
-    const uint8_t *     patt  = ptq1_1_pattern(bq, kbx, codebook, esc_patt, esc_idx, n_esc);
-
+// caller resolves the 5-byte pattern once per super-block and reuses it for every column.
+static __device__ __forceinline__ float vec_dot_ptq1_1_q8_1_patt(const block_ptq1_1 * __restrict__ bq,
+                                                                const block_q8_1 * __restrict__ bq8_1,
+                                                                const int & iqs,
+                                                                const uint8_t * __restrict__ patt) {
     float acc = 0.0f;
 #pragma unroll
     for (int s = 0; s < 8; ++s) {

@@ -375,6 +375,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_PTQ1_0:
             mmq_supported = turing_mma_available(cc);
             break;
+        case GGML_TYPE_PTQ1_1:
+            return false; // no tile loader; the type uses the dedicated mat-vec only
 #endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:

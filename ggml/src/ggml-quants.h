@@ -50,9 +50,22 @@ GGML_API void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_pq2_0(const block_pq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_ptq1_0(const block_ptq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_ptq1_1(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+// same, with the pattern tables and the flat super-block index of the first block.
+// esc entries pack the super-block index in the high 24 bits, sorted by it.
+GGML_API void dequantize_row_ptq1_1_esc(const block_ptq1_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k,
+                                        const uint8_t * codebook, const uint64_t * esc, int64_t n_esc,
+                                        int64_t sb_base);
 // PTQ1_1 codes index a model-wide pattern table that cannot live in the tensor
 // buffer, because type_size is exact. The loader installs it before use.
 GGML_API void ggml_ptq1_1_set_codebook(const uint8_t * codebook);
+// Escape list of one PTQ1_1 tensor. Each entry packs the super-block index in the
+// high 24 bits and the 40-bit exponent pattern in the low bits. Keyed by tensor name,
+// so the scheduler copy of a weight shares the list of the original. The loader sets
+// it before any backend reads the tensor; get returns false for an unknown name.
+GGML_API void ggml_ptq1_1_set_escape(const struct ggml_tensor * tensor, const uint8_t * codebook,
+                                     const uint64_t * esc, int64_t n_esc);
+GGML_API bool ggml_ptq1_1_get_escape(const struct ggml_tensor * tensor, const uint8_t ** codebook,
+                                     const uint64_t ** esc, int64_t * n_esc);
 GGML_API void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

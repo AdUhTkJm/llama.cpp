@@ -56,7 +56,7 @@ target_compile_definitions(llama PRIVATE
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
