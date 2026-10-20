@@ -329,17 +329,16 @@ PTQ1_0, and the remainder is the per-block pattern and tail decode, see
 [ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md) section 6. Before the PT kernel this
 decode rate was 16.7 t/s, so the same file is 1.8x faster now.
 
+Graph fusion works for PTQ1_1: `mul_mat_vec_ptq1_1_pt` and the `block_q8_1`
+fallback take the `ggml_cuda_mm_fusion_args_device` epilogue, so
+`MUL_MAT` + `MUL_MAT` + `GLU` (gate/up) fuses like it does for PTQ1_0. That is
+the one this model needs, qwen35 has no ffn bias. `MUL_MAT` + `ADD` also works
+through the same epilogue; the scale variants remain NVFP4 only.
+
 Still open:
 
 - The MMQ tile loader and `convert.cu`, so prompt processing leaves the mat-vec
   path. That is the whole pp512 gap.
-- Graph fusion. `ggml_cuda_should_fuse_mul_mat_vec_q` returns false for PTQ1_1,
-  so none of the fused mat-vec variants run: `MUL_MAT` + `ADD` (bias),
-  `MUL_MAT` + `MUL_MAT` + `GLU` (gate/up), and `MUL_MAT` + `ADD` + `MUL_MAT` +
-  `ADD` + `GLU`. Only the gate/up one fires on this model, qwen35 has no ffn
-  bias. Both kernels need a `ggml_cuda_mm_fusion_args_device` epilogue before
-  that check can be relaxed; `mul_mat_vec_ptq1_1_pt` already picks the lane that
-  writes the row, so that is the place to add it.
 
 One loose end: the file records `general.file_type = 130`, which is the `ggml.h`
 number, while `llama.h` uses 144 for the same format and the PTQ1_0 file carries

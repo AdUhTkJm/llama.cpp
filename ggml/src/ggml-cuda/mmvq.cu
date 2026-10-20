@@ -1437,7 +1437,7 @@ static void mul_mat_vec_q_switch_type(
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride, const ggml_cuda_q8_1_layout y_layout, const int64_t sb_row_base,
-        const ggml_tensor * src0, cudaStream_t stream) {
+        const ggml_tensor * src0, const ggml_tensor * gate_w, cudaStream_t stream) {
 #if !defined(GGML_USE_HIP)
     if (type_x == GGML_TYPE_PTQ1_1) {
         // MUL_MAT_ID is not supported: the escape list cannot be resolved from the ids.
@@ -1445,20 +1445,27 @@ static void mul_mat_vec_q_switch_type(
         // ggml_cuda_q8_1_layout_host picked above; batched MUL_MAT walks the columns as
         // block_q8_1 in groups of 8.
         GGML_ASSERT(!ids);
-        const ptq1_1_tables t = ptq1_1_tables_get(src0, ggml_cuda_get_device());
+        const int device = ggml_cuda_get_device();
+        const ptq1_1_tables t = ptq1_1_tables_get(src0, device);
+        // the gate tensor has its own escape list, so the fused lane needs its own tables
+        ptq1_1_tables gt = {};
+        if (fusion.gate) {
+            GGML_ASSERT(gate_w != nullptr);
+            gt = ptq1_1_tables_get(gate_w, device);
+        }
         if (y_layout == GGML_CUDA_Q8_1_PT) {
             GGML_ASSERT(nchannels_dst == 1 && nsamples_dst == 1);
-            mul_mat_vec_ptq1_1_pt_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst,
+            mul_mat_vec_ptq1_1_pt_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
                                          stride_row_x, stride_col_y, stride_col_dst,
-                                         sb_row_base, t, stream);
+                                         sb_row_base, t, gt, stream);
             return;
         }
         GGML_ASSERT(y_layout == GGML_CUDA_Q8_1_AOS);
-        mul_mat_vec_ptq1_1_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst,
+        mul_mat_vec_ptq1_1_switch(vx, vy, fusion, dst, ncols_x, nrows_x, ncols_dst,
                                   stride_row_x, stride_col_y, stride_col_dst,
                                   nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                                   nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
-                                  sb_row_base, t, stream);
+                                  sb_row_base, t, gt, stream);
         return;
     }
 #endif
@@ -1749,7 +1756,8 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, 0, src0, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, y_layout, 0, src0,
+        fusion ? fusion->gate : nullptr, stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
@@ -1781,7 +1789,7 @@ void ggml_cuda_op_mul_mat_vec_q(
             src1->ne[2] == 1 && src1->ne[3] == 1);
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, y_layout, row_low, src0, stream);
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, y_layout, row_low, src0, nullptr, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }

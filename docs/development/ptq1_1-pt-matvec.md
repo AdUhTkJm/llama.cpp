@@ -404,6 +404,88 @@ multiple of `ROWS` that fills whole 128-thread iterations and stays inside 16 Ki
 of shared memory. For `K = 5120` that is 16 rows, so 4 row groups x 40 blocks = 160
 items, which is 1.25 iterations over 128 threads.
 
+### 4.1 Fused gate/up epilogue
+
+The graph can fuse the two mat-vecs that feed a GLU into one launch:
+`MUL_MAT` + `MUL_MAT` + `GLU` (gate/up). The kernel that writes `dst` computes
+the up lane, and `fusion.gate` points at the gate weights. Only one column is
+fused, because `ggml_cuda_should_fuse_mul_mat_vec_q` allows fusion only when
+`dst->ne[1] == 1`.
+
+The launch carries four extra inputs:
+
+| input | use |
+| --- | --- |
+| `fusion.gate` | gate weight buffer, same shape and strides as up |
+| `fusion.x_bias`, `fusion.gate_bias` | optional fp32 bias, one value per row |
+| `fusion.glu_op` | SWIGLU, GEGLU or SWIGLU_OAI |
+| `gate_t` | codebook and escape list of the gate tensor |
+
+The gate tensor has its own super-block indices, so it has its own escape list.
+`ptq1_1_tables_get()` resolves it once per launch, the same way it resolves the
+up tables.
+
+Each work item now stores two partials per (column, row, K block), so the launch
+requests twice the shared memory:
+
+```
+ partials      [col][row_in_cta][kbx]     up dot
+ partials_gate [col][row_in_cta][kbx]     gate dot
+```
+
+`partials_gate` is `partials + ncols*rows_cta*bprp`, and
+`ptq1_0_pt_smem_bytes(..., has_gate)` reports the size to the launcher.
+`rows_cta` is still chosen from the one-array 16 KiB budget; the switch then
+asserts that the doubled request fits the device shared-memory limit. The gate
+dot reuses the activation pieces loaded for the up dot: entry `kbx` of the same
+`ycol` is what both mat-vecs need. The gate side repeats the weight decode and
+the dp4a walk with the gate words, the gate tables and the same `w_off`:
+
+```cpp
+if constexpr (has_gate) {
+    const block_ptq1_1 * b = (const block_ptq1_1 *) fusion.gate + w_off;
+    const uint8_t * patt = ptq1_1_pattern(b, sb_base + w_off,
+            gate_t.codebook, gate_t.esc_patt, gate_t.esc_idx, gate_t.n_esc);
+    gqs[i] = b->qs[sub];
+    gtl[i] = ptq1_1_tail8(b, sub);
+    gd[i]  = ptq1_1_scale(b, patt, sub);
+}
+```
+
+`ptq1_1_pt_block_dot` runs a second time with `gqs`, `gtl` and `gd` on the same
+`ycol`. The epilogue sums the two partial arrays with the same four accumulators,
+then the lane that owns the row writes it once:
+
+```cpp
+float result = (s0 + s1) + (s2 + s3);           // up
+if (fusion.x_bias) {
+    result += ((const float *) fusion.x_bias)[j*stride_col_dst + row];
+}
+float gate_value = (g0 + g1) + (g2 + g3);       // gate
+if (fusion.gate_bias) {
+    gate_value += ((const float *) fusion.gate_bias)[j*stride_col_dst + row];
+}
+result = ptq1_1_glu_apply(result, gate_value, fusion.glu_op);
+dst[j*stride_col_dst + row] = result;
+```
+
+`ptq1_1_glu_apply` uses the same expression order as the generic MMVQ kernel:
+`x * silu(gate)` for SWIGLU, `x * gelu(gate)` for GEGLU, and
+`swiglu_oai(gate, x)` for SWIGLU_OAI. The up dot, the gate dot and the folds are
+the same code as in the non-fused kernel, so enabling fusion does not change the
+result bits.
+
+The kernel is templated on `has_fusion` and `has_gate`. A call without fusion
+instantiates the original body, so the non-fused path does not pay for the extra
+arrays or the second shared-memory region.
+
+Without fusion the graph writes the gate output and the up output, then the GLU
+kernel reads both. The fused path writes one value per row and never materializes
+the other two. On the 27B model this is about a 3% decode gain on the PT kernel.
+The `block_q8_1` fallback carries the same epilogue, with bias offsets indexed by
+sample and destination channel; it is the path taken when `GGML_CUDA_PTQ1_1_PT=0`
+or when the call is not plain 2D.
+
 ## 5. Which kernel runs
 
 Two things must agree: the layout the activation quantizer writes, and the kernel
@@ -418,6 +500,10 @@ A call then reaches `mul_mat_vec_ptq1_1_pt_switch` (planar) or
 `mul_mat_vec_ptq1_1_switch` (the fallback: one row per thread, whole K per
 thread, plain `block_q8_1`, 8 columns per launch). `GGML_CUDA_PTQ1_1_PT=0` forces
 the fallback so the two can be compared on the same build.
+
+Gate/up fusion only happens at one column, so it does not change this layout
+decision: a fused call is still a plain 2D one-column call. `GGML_CUDA_DISABLE_FUSION=1`
+turns the fused epilogue off for A/B runs.
 
 `MUL_MAT_ID` is not supported by either kernel: the escape list is per tensor, and
 the kernel cannot map an expert id back to it.
@@ -541,8 +627,7 @@ The cheap fixes, in order of effort:
   spilled. PTQ1_0's has none. Look at that before adding registers.
 
 The remaining large gap is not in this kernel: prompt processing does not use it
-(see section 10 of [ptq1_1-format.md](ptq1_1-format.md)), and graph fusion is not
-implemented for PTQ1_1 yet.
+(see section 10 of [ptq1_1-format.md](ptq1_1-format.md)).
 
 ## 7. Traps when editing this kernel
 
