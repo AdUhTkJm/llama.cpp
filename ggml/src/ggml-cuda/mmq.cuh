@@ -455,6 +455,18 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
     return (txs.qs + txs.dm + txs.sc) * 4;
 }
 
+// PTQ1_1 keeps the eight scales of one super-block per row of the x tile after the tile itself,
+// so that the four K iterations covering a super-block decode them once.
+static __host__ int ggml_cuda_mmq_get_nbytes_shared_sc(const ggml_type type, const int I) {
+#if !defined(GGML_USE_HIP)
+    if (type == GGML_TYPE_PTQ1_1) {
+        return I * (QK_PTQ1_1 / 128) * (int) sizeof(float);
+    }
+#endif
+    GGML_UNUSED_VARS(type, I);
+    return 0;
+}
+
 // ------------------------------------------------------------
 
 #include "mmq-load-tiles.cuh"
@@ -923,11 +935,11 @@ static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_ti
 // here instead of extending ggml_cuda_mmq_load_tiles_t keeps the other loaders untouched.
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles(
-        const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride,
-        const ptq1_1_tables & tbl) {
+        const char * __restrict__ x, int * x_tile, const int kbx0, const int kbx0_start,
+        const int i_max, const int stride, const ptq1_1_tables & tbl) {
 #if !defined(GGML_USE_HIP)
     if constexpr (type == GGML_TYPE_PTQ1_1) {
-        ggml_cuda_mmq_load_tiles_ptq1_1<type, J, fallback>(x, x_tile, kbx0, i_max, stride, tbl);
+        ggml_cuda_mmq_load_tiles_ptq1_1<type, J, fallback>(x, x_tile, kbx0, kbx0_start, i_max, stride, tbl);
         return;
     }
 #endif
@@ -1002,10 +1014,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 cp_async_cg_16<256>(
                     ggml_cuda_cvta_generic_to_shared(tile_y_bytes + byte0), by0 + byte0);
             }
-            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, tile_x_max_i, stride_row_x, tbl);
+            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, offset_x*k_ratio + kb0_start, tile_x_max_i, stride_row_x, tbl);
             cp_async_wait_all();
         } else {
-            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, tile_x_max_i, stride_row_x, tbl);
+            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, offset_x*k_ratio + kb0_start, tile_x_max_i, stride_row_x, tbl);
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -1527,12 +1539,13 @@ struct mmq_args {
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+    const size_t nbs_sc = ggml_cuda_mmq_get_nbytes_shared_sc(config.type, config.I);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     const size_t nbs_y_padded = GGML_PAD(nbs_y, config.nthreads*sizeof(int));
     const bool async_buffer_y = cc == GGML_CUDA_CC_DGX_SPARK &&
         (config.type == GGML_TYPE_Q1_0 || config.type == GGML_TYPE_Q2_0 || config.type == GGML_TYPE_PQ2_0);
     const int y_buffers = async_buffer_y ? 2 : 1;
-    return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
+    return nbs_ids + nbs_x + nbs_sc + y_buffers*nbs_y_padded;
 }
 
 template <ggml_type type, int J, bool fallback>

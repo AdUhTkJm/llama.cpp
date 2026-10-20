@@ -35,6 +35,10 @@ row i:  [ 64 int8 words ] [ 8 fp32 scales ]     sram_stride = 72 ints
 `x_df` is `x_qs + 2*MMQ_TILE_NE_K`, one float per 32-weight block, so the 8
 entries of a row are the scales of the 8 32-blocks of the 256 K slice.
 
+The loader also gets `kbx0_start`, the first sub-block of the whole K range of
+the tile. It only needs it to know whether the first call of a range starts a
+super-block or lands in the middle of one, which is a stream-k case.
+
 PTQ1_1 stores 1024 weights per block and the tile wants 128, so the loader
 counts **128-weight sub-blocks**, not blocks. `kbx0` and `stride` reach it in
 sub-block units: `mul_mat_q_process_tile` multiplies `offset_x` by
@@ -102,42 +106,65 @@ Escapes are rare (0.0012% of super-blocks on this model file) and keep the
 packed path: the loader only takes `ptq1_1_pattern`'s binary search when
 `code == 767`.
 
+## 4a. The eight scales are decoded once per super-block
+
+Four consecutive loader calls cover one super-block, and each of them needs two
+of its eight scales. The scale decode is the expensive half of the decode, so
+the first call of the four decodes all eight and leaves them in shared memory:
+`x_sc`, 4 KiB for the 128 rows of the tile, right after the tile itself.
+
+On that fill call the eight lanes of a row each take one sub-block instead of
+four lanes taking the same one, so the pattern lookup is done once and the
+mantissa reads of the row are spread over its 11 `sc` bytes. The permutation
+puts sub-block `s0` and `s0 + 1` in lanes 0 and 4, which is where the shuffle
+reads them from to write `x_df`. The other three calls are one `LDS` and one
+`STS` per lane.
+
+The row stride is a whole number of super-blocks, so every row of the tile is at
+the same phase and the fill is a block-uniform branch. A K range that starts in
+the middle of a super-block fills on its first call instead; the fill is correct
+there because the permutation is rotated by `s0`.
+
 ## 5. Measured cost of each part
 
-All `llama-bench -p 512 -n 0`, idle GPU, same build, PTQ1_0 for reference. During
-development the loader was switched by an environment variable to skip parts of
-the decode, so the row is the same kernel with decode work removed (wrong
-results, timing only):
+All `llama-bench -p 512 -n 0`. This laptop GPU drifts with temperature, so the
+numbers below come from swapping the built `libggml-cuda.so` between runs inside
+one session and taking the median of the samples after the clock ramp. During
+development the loader was also switched to skip parts of the decode, so the
+last row is the same kernel with decode work removed (wrong results, timing
+only):
 
 | variant | pp512 t/s |
 | --- | --- |
-| PTQ1_0, same build | 610 |
-| PTQ1_1, whole loader does nothing | 718 |
-| PTQ1_1, trit walk + tails, no scale decode | 495 |
-| PTQ1_1, everything except the 8-lane scale loop | 452 |
-| PTQ1_1, current | 445 |
+| PTQ1_0, same build | 596 |
+| PTQ1_1, before the two changes below | 431 |
+| PTQ1_1, row loop unrolled | 538 |
+| PTQ1_1, unrolled and scale cached | 544 |
+| PTQ1_1, scale decode and tail store removed | 611 |
 
-Read it top to bottom: the MMA itself would be ~15% faster than PTQ1_0 (fewer
-weight bytes), the decode costs 38%, of which the scale loop is 8 points and the
-trit walk plus tails the rest. The PTQ1_0 loader is about 15% of its own runtime,
-so the PTQ1_1 loader is roughly 2.5x as expensive and the result is 73% of
-PTQ1_0's prefill.
+Read it top to bottom: the row loop of the qs and tail section was the whole
+problem. It was the only loop in the loader without `#pragma unroll`, so the
+`qh` byte it loads is a streamed VRAM read whose result the next instruction
+uses, eight times per call, with one block of eight warps per SM to hide it.
+Unrolling lets the compiler issue the eight loads before the first store and
+buys 25%; skipping the tail store was worth 11% before that and is worth 1% now.
+
+The scale plane is 7% of the runtime as eight lanes per row decoding four times
+each, and the cache above takes a third of that back. What is left of the
+PTQ1_1-specific decode - tail plus scale - is 11% of the prefill time. With it
+removed the loader is level with PTQ1_0's rather than 15% faster: the MMA does
+the same work, and PTQ1_1 reads 216 bytes per super-block against 210.
 
 ## 6. What is left
 
-In order of expected value:
-
-* cache the eight scales of a super-block in shared memory (4 KiB for 128 rows)
-  and fill it on the first of the four iterations, which removes the pattern
-  lookup and seven of the eight mantissa reads from three of four iterations.
-* decode the three `qh` bytes of a sub-block with the byte-parallel walk used for
-  `qs` (four digits per instruction group) instead of two multiplies per digit.
-  The permutation from the interleaved digit order to the tile order is what made
-  `ptq1_1_tail8` slow, so this only pays if the digits are written as bytes, as
-  they are now.
-* share the pattern decode across the eight lanes of a row with `__shfl_sync`.
-  It removes loads, not instructions, and the loader is not obviously load bound
-  any more.
+* the fill call still reads the mantissa with three byte loads per lane. Two
+  always suffice (bit `10*s + 9` never leaves byte `(10*s)/8 + 1`), but `sc`
+  starts at offset 205 of a 216-byte block, so no wider load can be aligned.
+* the tail digit is 1% of the runtime now. The byte-parallel walk is not worth
+  it: the cost was never the two multiplies, it was the dependent load.
+* sharing the pattern decode between lanes with `__shfl_sync` is subsumed by the
+  cache: a fill already gives each of the eight lanes a different sub-block, so
+  no lane repeats another's work.
 
 Not worth it: raising `MMQ_ITER_K` for this type. The x tile stride is a function
 of the sram layout, not of `K_vram`, so 1024-element iterations would not fit.
@@ -157,3 +184,12 @@ of the sram layout, not of `K_vram`, so 1024-element iterations would not fit.
 * The loader writes only the MMA data layout. There is no dp4a variant of
   PTQ1_1's tile, and `should_use_mmq` keeps the type off devices without Turing
   MMA for that reason.
+* The qs and tail loop must stay `#pragma unroll`. Removing it costs 25% of the
+  prefill rate, more than everything else in this note put together.
+* `x_sc` is placed after the tile, so 4 KiB has to be added to
+  `mmq_get_nbytes_shared` when it is there; `ggml_cuda_mmq_get_nbytes_shared_sc`
+  is the one place that knows. A tile that overruns its stride would corrupt the
+  scales instead of crashing.
+* The fill permutation is rotated by `s0`. Without the rotation a stream-k range
+  that starts mid-super-block writes subs 0 and 1 into `x_df` where it needs
+  `s0` and `s0 + 1`, which is a 0.2% perplexity change and no crash.

@@ -367,6 +367,7 @@ template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_1(const char * __restrict__ x,
                                                                       int * __restrict__ x_tile,
                                                                       const int kbx0,
+                                                                      const int kbx0_start,
                                                                       const int i_max,
                                                                       const int stride,
                                                                       const ptq1_1_tables & tbl) {
@@ -414,6 +415,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_1(const cha
 
     const bool full_lane = lane < 6;
 
+#pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
         int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         if (fallback) {
@@ -454,6 +456,20 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_1(const cha
     const int     ksx                   = threadIdx.x % scale_entries_per_row;
     const int     scale_block           = ksx / scale_entries_per_block;
 
+    // A super-block spans four K iterations and its eight scales are the same in all of them.
+    // The first iteration decodes all eight into x_sc, the other three read it back. The row
+    // stride is a whole number of super-blocks, so every row of a tile is at the same phase
+    // and a call that starts mid-super-block fills its cache on the first iteration.
+    float * const x_sc = (float *) (x_tile + I * sram_stride);
+
+    const int  s0      = kbx0 & (subs_per_row - 1);
+    const bool sc_fill = s0 == 0 || kbx0 == kbx0_start;
+
+    // lanes 0..7 of a row hold its eight scale entries, so a fill gives each lane one sub-block;
+    // the rotation puts the two sub-blocks of this call in lanes 0 and 4, where the shuffle
+    // below reads them from
+    const int sub_fill = (s0 + (((ksx & 3) << 1) | (ksx >> 2))) & (subs_per_row - 1);
+
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
         int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / scale_entries_per_row;
@@ -466,13 +482,21 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_1(const cha
         const int64_t sb   = flat_sub / subs_per_row;
         const int     sub  = flat_sub % subs_per_row;
 
-        const block_ptq1_1 * bxi = (const block_ptq1_1 *) x + sb;
+        float d;
+        if (sc_fill) {
+            const block_ptq1_1 * bxi = (const block_ptq1_1 *) x + sb;
 
-        // 767 codes read as one aligned 8-byte word; only the escape needs the packed bytes
-        const int code = ptq1_1_code(bxi);
-        const float d  = code < 767
-            ? ptq1_1_scale_exp(bxi, ptq1_1_pattern_exp64(tbl.codebook64[code], sub), sub)
-            : ptq1_1_scale(bxi, ptq1_1_pattern(bxi, sb, tbl.codebook, tbl.esc_patt, tbl.esc_idx, tbl.n_esc), sub);
+            // 767 codes read as one aligned 8-byte word; only the escape needs the packed bytes
+            const int code = ptq1_1_code(bxi);
+            const float df = code < 767
+                ? ptq1_1_scale_exp(bxi, ptq1_1_pattern_exp64(tbl.codebook64[code], sub_fill), sub_fill)
+                : ptq1_1_scale(bxi, ptq1_1_pattern(bxi, sb, tbl.codebook, tbl.esc_patt, tbl.esc_idx, tbl.n_esc), sub_fill);
+
+            x_sc[i * subs_per_row + sub_fill] = df;
+            d = __shfl_sync(0xffffffff, df, scale_block * scale_entries_per_block, scale_entries_per_row);
+        } else {
+            d = x_sc[i * subs_per_row + sub];
+        }
 
         x_df[i * sram_stride + ksx] = d;
     }
