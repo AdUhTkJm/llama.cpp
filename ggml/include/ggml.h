@@ -181,7 +181,7 @@
 #            define GGML_API __declspec(dllimport) extern
 #        endif
 #    else
-#        define GGML_API __attribute__ ((visibility ("default"))) extern
+#        define GGML_API __attribute__ ((visibility ("default")))
 #    endif
 #else
 #    define GGML_API extern
@@ -430,8 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
         // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
-        // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
+        // slots above upstream types; type_traits is sized to COUNT (145) with 48..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
         GGML_TYPE_PTQ1_1 = 144, // Prism-private ternary, super-block 1024, coded scale plane
@@ -578,6 +583,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_TURBO_WHT,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2630,6 +2636,16 @@ extern "C" {
             struct ggml_tensor  * dt_bias,
             struct ggml_tensor  * a);
 
+    // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
+    // Applies WHT rotation to 128-element groups along ne[0]: sign1 -> butterfly -> sign2 -> normalize
+    // direction: 0 = forward (signs1 -> WHT -> signs2), 1 = inverse (signs2 -> WHT -> signs1)
+    GGML_API struct ggml_tensor * ggml_turbo_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   direction,
+            int                   group_size,    // 0 = auto (64 or 128 from ne[0])
+            struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2649,8 +2665,6 @@ extern "C" {
         struct ggml_tensor  * mask);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
-    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
-    // using a richer representation through streams.
     //
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
@@ -2674,11 +2688,9 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
-    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
-    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
-    //   result[i, dst, t] = x[i, t]*post[dst, t]
-    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   result[i, h, t] = x[i, t] * post[h, t] + sum_src residual[i, src, t] * comb[h, src, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
