@@ -36,7 +36,7 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 
 SOURCE_FATTN_MMA_CASE_KV = "DECL_FATTN_MMA_F16_CASE_KV({head_size_kq}, {head_size_v}, {ncols1}, {ncols2}, {type_kv});\n"
 
-TYPES_KV_MMA_NATIVE = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0"]
+TYPES_KV_MMA_NATIVE = ["GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_TURBO2_0", "GGML_TYPE_TURBO3_0", "GGML_TYPE_TURBO4_0"]
 HEAD_SIZES_MMA_NATIVE = [128, 256]
 
 TYPES_MMQ = [
@@ -120,7 +120,7 @@ for ncols in [8, 16, 32, 64]:
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
 # In-place quantized K/V variants of the MMA kernel (no F16 copy of the cache): the head sizes and GQA tilings
-# a q4_0 / q8_0 cache is served with in practice. Kept to one file per (type, ncols1, ncols2) for parallel builds.
+# a q4_0 / q8_0 / turbo cache is served with in practice. Kept to one file per (type, ncols1, ncols2) for parallel builds.
 for type_kv in TYPES_KV_MMA_NATIVE:
     for ncols in [8, 16, 32, 64]:
         for ncols2 in [1, 2, 4, 8]:

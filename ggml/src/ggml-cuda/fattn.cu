@@ -12,7 +12,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
-    if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
+    // Short-query MMA FA with quantized V used to crash (#189). The workaround only applies to the q4_0/q8_0
+    // loaders; turbo loads full-row tiles and keeps its in-place kernel.
+    if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4 &&
+            !ggml_cuda_fattn_mma_kv_turbo(V->type, V->type)) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
         return;
     }
@@ -114,6 +117,31 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_KV>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
+    }
+}
+
+// Dispatch to the in-place quantized K/V MMA kernels, for the types accepted by
+// ggml_cuda_fattn_mma_kv_native_supported().
+template <int DKQ, int DV>
+static void ggml_cuda_flash_attn_ext_mma_f16_switch_native(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_Q4_0:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV, GGML_TYPE_Q4_0>(ctx, dst);
+            return;
+        case GGML_TYPE_Q8_0:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV, GGML_TYPE_Q8_0>(ctx, dst);
+            return;
+        case GGML_TYPE_TURBO2_0:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV, GGML_TYPE_TURBO2_0>(ctx, dst);
+            return;
+        case GGML_TYPE_TURBO3_0:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV, GGML_TYPE_TURBO3_0>(ctx, dst);
+            return;
+        case GGML_TYPE_TURBO4_0:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<DKQ, DV, GGML_TYPE_TURBO4_0>(ctx, dst);
+            return;
+        default:
+            GGML_ABORT("fatal error: no in-place K/V kernel for %s", ggml_type_name(dst->src[1]->type));
     }
 }
 
@@ -229,11 +257,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
-                if (K->type == GGML_TYPE_Q4_0) {
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q4_0>(ctx, dst);
-                } else {
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q8_0>(ctx, dst);
-                }
+                ggml_cuda_flash_attn_ext_mma_f16_switch_native<128, 128>(ctx, dst);
                 break;
             }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128>(ctx, dst);
@@ -257,11 +281,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
-                if (K->type == GGML_TYPE_Q4_0) {
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q4_0>(ctx, dst);
-                } else {
-                    ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q8_0>(ctx, dst);
-                }
+                ggml_cuda_flash_attn_ext_mma_f16_switch_native<256, 256>(ctx, dst);
                 break;
             }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256>(ctx, dst);

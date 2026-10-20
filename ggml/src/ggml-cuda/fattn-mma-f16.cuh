@@ -2256,12 +2256,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr int ncols = ncols1 * ncols2;
 
     if constexpr (type_KV != GGML_TYPE_F16) {
-        // The kernel reads the quantized cache in place: same K/V type, whole block pairs per row, word-aligned rows.
+        // The kernel reads the quantized cache in place: same K/V type and rows aligned for the block loads.
+        // turbo blocks are 10/14/66 bytes, so turbo rows must not be assumed 4-byte aligned.
+        constexpr size_t align = ggml_cuda_fattn_mma_kv_turbo(type_KV, type_KV) ? 2 : 4;
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         GGML_ASSERT(K->type == type_KV && V->type == type_KV);
-        GGML_ASSERT(K->nb[1] % 4 == 0 && K->nb[2] % 4 == 0 && K->nb[3] % 4 == 0);
-        GGML_ASSERT(V->nb[1] % 4 == 0 && V->nb[2] % 4 == 0 && V->nb[3] % 4 == 0);
+        GGML_ASSERT(K->nb[1] % align == 0 && K->nb[2] % align == 0 && K->nb[3] % align == 0);
+        GGML_ASSERT(V->nb[1] % align == 0 && V->nb[2] % align == 0 && V->nb[3] % align == 0);
     }
 
     const int  nthreads       = ggml_cuda_fattn_mma_get_nthreads      (DKQ, DV, ncols, cc);
@@ -2362,6 +2364,33 @@ DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 16, GGML_TYPE_Q8_0)
 DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 32, GGML_TYPE_Q8_0)
 DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 64, GGML_TYPE_Q8_0)
 
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128,  8, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 16, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 32, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 64, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256,  8, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 16, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 32, GGML_TYPE_TURBO2_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 64, GGML_TYPE_TURBO2_0)
+
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128,  8, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 16, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 32, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 64, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256,  8, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 16, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 32, GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 64, GGML_TYPE_TURBO3_0)
+
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128,  8, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 16, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 32, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(128, 128, 64, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256,  8, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 16, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 32, GGML_TYPE_TURBO4_0)
+DECL_FATTN_MMA_F16_CASE_KV_ALL_NCOLS2(256, 256, 64, GGML_TYPE_TURBO4_0)
+
 // Head sizes with in-place quantized K/V kernels (matches the instantiations above).
 static inline bool ggml_cuda_fattn_mma_kv_native_supported(const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
@@ -2375,13 +2404,20 @@ static inline bool ggml_cuda_fattn_mma_kv_native_supported(const ggml_tensor * d
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (K->type != V->type || !ggml_cuda_fattn_mma_kv_native(K->type)) {
+    if (K->type != V->type) {
         return false;
     }
     if (!(Q->ne[0] == 128 || Q->ne[0] == 256) || V->ne[0] != Q->ne[0]) {
         return false;
     }
-    return ggml_cuda_is_aligned(K, 4) && ggml_cuda_is_aligned(V, 4);
+    if (ggml_cuda_fattn_mma_kv_native(K->type)) {
+        return ggml_cuda_is_aligned(K, 4) && ggml_cuda_is_aligned(V, 4);
+    }
+    if (turing_mma_available(cc) && ggml_cuda_fattn_mma_kv_turbo(K->type, V->type)) {
+        // turbo blocks are 10/14/66 bytes, so rows must not be assumed 4-byte aligned
+        return ggml_cuda_is_aligned(K, 2) && ggml_cuda_is_aligned(V, 2);
+    }
+    return false;
 #endif
 }
 
