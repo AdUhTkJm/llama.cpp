@@ -7,6 +7,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -299,9 +300,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     }
 #if !defined(GGML_USE_HIP)
     if (type == GGML_TYPE_PTQ1_1) {
-        // Only path for PTQ1_1: no MMQ tile loader and no cuBLAS convert function.
-        // The plain 2D mat-vec handles any column count, chunked in groups of 8.
-        return true;
+        // Narrow batches take the planar mat-vec; wider ones take the MMQ tile path, which reads
+        // the weights once for the whole batch instead of once per 8-column group. Pre-Turing
+        // devices have no tile loader for this type, so the mat-vec stays their only path.
+        if (!turing_mma_available(cc)) {
+            return true;
+        }
+        static const int64_t max_batch = [] {
+            const char * s = getenv("GGML_CUDA_PTQ1_1_MMVQ_MAX_BATCH");
+            return s ? (int64_t) atoll(s) : (int64_t) 8;
+        }();
+        return ne11 <= max_batch;
     }
     if (type == GGML_TYPE_PTQ1_0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING) {
         // The PT mat-vec path shares the weight decode across columns; with the branch-free PTQ1_0

@@ -1080,9 +1080,17 @@ static __device__ __forceinline__ int ptq1_1_digit_at(const block_ptq1_1 * x, co
     return ptq1_1_digit(x->qh[p / 5], p % 5);
 }
 
-// sc[10] holds the high part of the code, digit 4 of qh[12] the base-3 low part
+// sc[10] holds the high part of the code, digit 4 of qh[12] the base-3 low part. After n steps
+// of the recurrence the state is (3^n * v) mod 256, so the fixed n = 4 needs no loop.
 static __device__ __forceinline__ int ptq1_1_code(const block_ptq1_1 * x) {
-    return (int) x->sc[10]*3 + ptq1_1_digit(x->qh[12], 4);
+    const uint32_t v = (81u * x->qh[12]) & 0xFF;
+    return (int) x->sc[10]*3 + (int) ((3*v) >> 8);
+}
+
+// exponent s (0..7) of a pattern held as one 8-byte word, which is how the MMQ tile loader
+// reads the codebook. The field at s = 6 starts at bit 30, so the shift has to be 64 bits wide.
+static __device__ __forceinline__ int ptq1_1_pattern_exp64(const uint64_t patt, const int s) {
+    return (int) ((patt >> (5*s)) & 0x1F);
 }
 
 // exponent s (0..7) of a pattern, 5 bits each, little endian in 5 bytes
@@ -1095,25 +1103,37 @@ static __device__ __forceinline__ int ptq1_1_pattern_exp(const uint8_t * patt, c
     return (int) ((v >> (5*s)) & 0x1F);
 }
 
-// mantissa of sub-block s, 10 bits at bit 10*s of sc[0..9]
+// mantissa of sub-block s, 10 bits at bit 10*s of sc[0..9]. The three bytes always fit: s = 7
+// starts at byte 8 and the bits it needs end at bit 79, so the third byte can only contribute
+// bits that the mask below drops.
 static __device__ __forceinline__ int ptq1_1_mantissa(const block_ptq1_1 * x, const int s) {
     const int byte = (10*s) >> 3;
     const int off  = (10*s) & 7;
-    uint32_t v = 0;
-#pragma unroll
-    for (int i = 0; i < 3; ++i) {
-        if (byte + i < 10) {
-            v |= (uint32_t) x->sc[byte + i] << (8*i);
-        }
-    }
+    const uint32_t v = (uint32_t) x->sc[byte] | ((uint32_t) x->sc[byte + 1] << 8) | ((uint32_t) x->sc[byte + 2] << 16);
     return (int) ((v >> off) & 0x3FF);
 }
 
-// fp16 scale of sub-block s; the format stores no sign, the exponent field is 5 bits
-static __device__ __forceinline__ float ptq1_1_scale(const block_ptq1_1 * x, const uint8_t * patt, const int s) {
-    const uint16_t bits = (uint16_t) ((ptq1_1_pattern_exp(patt, s) << 10) | ptq1_1_mantissa(x, s));
+// fp16 scale of sub-block s from its 5-bit exponent; the format stores no sign
+static __device__ __forceinline__ float ptq1_1_scale_exp(const block_ptq1_1 * x, const int e, const int s) {
+    const uint16_t bits = (uint16_t) ((e << 10) | ptq1_1_mantissa(x, s));
     return __half2float(__ushort_as_half(bits));
 }
+
+// same, with the exponent still packed in the 5-byte pattern
+static __device__ __forceinline__ float ptq1_1_scale(const block_ptq1_1 * x, const uint8_t * patt, const int s) {
+    return ptq1_1_scale_exp(x, ptq1_1_pattern_exp(patt, s), s);
+}
+
+// The two model tables a PTQ1_1 kernel needs. The codebook is model-wide, the escape list
+// is per tensor; neither fits in the block, so the loader registers them in ggml-base keyed
+// by tensor and the backend passes this record to the kernel.
+struct ptq1_1_tables {
+    const uint8_t  * codebook;     // 767 patterns, 5 bytes each
+    const uint64_t * codebook64;   // the same 767 patterns, one 8-byte word each, aligned for a single load
+    const uint8_t  * esc_patt;
+    const uint32_t * esc_idx;
+    int              n_esc;
+};
 
 // 5-byte exponent pattern of a super-block. code < 767 indexes the model-wide codebook;
 // 767 is the escape, resolved by binary search over the per-tensor list (sorted by
@@ -1141,6 +1161,37 @@ static __device__ __forceinline__ const uint8_t * ptq1_1_pattern(
         lo = n_esc > 0 ? n_esc - 1 : 0;
     }
     return esc_patt + 5*lo;
+}
+
+// 8 tail trits of sub-block s (elements 120..127), one per byte, low word first. qh pools
+// the 64 tails of a super-block at 5 per byte: trit k of sub-block s sits at position
+// p = 8*s + k, in byte p/5, digit p%5. The eight positions span at most three bytes, so
+// the five digits of each are expanded once and the run is picked out by its offset.
+static __device__ __forceinline__ uint2 ptq1_1_tail8(const block_ptq1_1 * x, const int s) {
+    const int p0  = 8*s;
+    const int i0  = p0 / 5;      // first byte of the run
+    const int off = p0 - 5*i0;   // digit index inside that byte
+    uint32_t  d0  = 0;
+    uint32_t  d1  = 0;
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        // the run never needs a byte past qh[12]; the third read of sub-block 7 lands in
+        // sc[0], which is inside the block, and its digits are shifted out below
+        uint32_t v = x->qh[i0 + i];
+#pragma unroll
+        for (int k = 0; k < 5; ++k) {
+            const uint32_t digit = (v * 3) >> 8;
+            v = (v * 3) & 0xFF;
+            const int j = 5*i + k - off;
+            if (j >= 0 && j < 4) {
+                d0 |= digit << (8*j);
+            }
+            if (j >= 4 && j < 8) {
+                d1 |= digit << (8*(j - 4));
+            }
+        }
+    }
+    return make_uint2(d0, d1);
 }
 
 template<>

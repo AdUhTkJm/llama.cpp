@@ -14,30 +14,39 @@
 #include <tuple>
 #include <vector>
 
-struct ptq1_1_tables {
-    const uint8_t  * codebook;
-    const uint8_t  * esc_patt;
-    const uint32_t * esc_idx;
-    int              n_esc;
-};
-
-static const uint8_t * ptq1_1_device_codebook(const uint8_t * host, int device) {
+// Two device copies of the 767 x 5 byte codebook: the packed bytes and one aligned 64-bit
+// word per pattern, which the MMQ tile loader reads with a single load.
+static void ptq1_1_device_codebook(const uint8_t * host, int device, const uint8_t ** out, const uint64_t ** out64) {
     static std::mutex mutex;
-    static std::map<std::pair<int, const uint8_t *>, const uint8_t *> cache;
+    static std::map<std::pair<int, const uint8_t *>, std::pair<const uint8_t *, const uint64_t *>> cache;
 
     std::lock_guard<std::mutex> lock(mutex);
     const auto key = std::make_pair(device, host);
     const auto it  = cache.find(key);
     if (it != cache.end()) {
-        return it->second;
+        *out   = it->second.first;
+        *out64 = it->second.second;
+        return;
     }
 
     constexpr size_t n = 767*5;
     uint8_t * dev = nullptr;
     CUDA_CHECK(cudaMalloc(&dev, n));
     CUDA_CHECK(cudaMemcpy(dev, host, n, cudaMemcpyHostToDevice));
-    cache.emplace(key, dev);
-    return dev;
+
+    std::vector<uint64_t> wide(767, 0);
+    for (size_t i = 0; i < 767; ++i) {
+        for (int b = 0; b < 5; ++b) {
+            wide[i] |= (uint64_t) host[5*i + b] << (8*b);
+        }
+    }
+    uint64_t * dev64 = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &dev64, wide.size()*sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpy(dev64, wide.data(), wide.size()*sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    cache.emplace(key, std::make_pair((const uint8_t *) dev, (const uint64_t *) dev64));
+    *out   = dev;
+    *out64 = dev64;
 }
 
 // w->data, the codebook pointer and the escape count form the key: a reloaded model can
@@ -66,7 +75,9 @@ static ptq1_1_tables ptq1_1_tables_get(const ggml_tensor * w, int device) {
         }
     }
 
-    ptq1_1_tables t = { ptq1_1_device_codebook(cb_host, device), nullptr, nullptr, (int) n_esc };
+    ptq1_1_tables t = {};
+    ptq1_1_device_codebook(cb_host, device, &t.codebook, &t.codebook64);
+    t.n_esc = (int) n_esc;
 
     std::vector<uint8_t>  patt(5*n_esc);
     std::vector<uint32_t> idx(n_esc);

@@ -6,7 +6,7 @@
 // 128-weight blocks of the same rows and the activations are read through the
 // planar-transposed (PT) layout, 16 bytes at a time. The PT layout, the 5-trit digit
 // step and the plane stride are shared with PTQ1_0; only the weight decode differs
-// (exponent pattern from the codebook plus the pooled tail trits).
+// (exponent pattern from the codebook plus the pooled tail trits, both in common.cuh).
 //
 // The second kernel walks one output row per thread on the plain block_q8_1 layout. It
 // covers the shapes the PT kernel does not take: batched MUL_MAT with channels or
@@ -20,37 +20,6 @@
 
 #define PTQ1_1_MMVQ_THREADS   256
 #define PTQ1_1_MMVQ_MAX_COLS  8 // columns per launch; wide batches run several launches
-
-// 8 tail trits of sub-block s (elements 120..127), one per byte, low word first. qh pools
-// the 64 tails of a super-block at 5 per byte: trit k of sub-block s sits at position
-// p = 8*s + k, in byte p/5, digit p%5. The eight positions span at most three bytes, so
-// the five digits of each are expanded once and the run is picked out by its offset.
-static __device__ __forceinline__ uint2 ptq1_1_tail8(const block_ptq1_1 * x, const int s) {
-    const int p0  = 8*s;
-    const int i0  = p0 / 5;      // first byte of the run
-    const int off = p0 - 5*i0;   // digit index inside that byte
-    uint32_t  d0  = 0;
-    uint32_t  d1  = 0;
-#pragma unroll
-    for (int i = 0; i < 3; ++i) {
-        // the run never needs a byte past qh[12]; the third read of sub-block 7 lands in
-        // sc[0], which is inside the block, and its digits are shifted out below
-        uint32_t v = x->qh[i0 + i];
-#pragma unroll
-        for (int k = 0; k < 5; ++k) {
-            const uint32_t digit = (v * 3) >> 8;
-            v = (v * 3) & 0xFF;
-            const int j = 5*i + k - off;
-            if (j >= 0 && j < 4) {
-                d0 |= digit << (8*j);
-            }
-            if (j >= 4 && j < 8) {
-                d1 |= digit << (8*(j - 4));
-            }
-        }
-    }
-    return make_uint2(d0, d1);
-}
 
 // Dot products of nrows PTQ1_1 sub-blocks (128 weights each) with the same K block of
 // ncols activation columns. qs[i] points at the 24 trit bytes of the sub-block, tl[i]

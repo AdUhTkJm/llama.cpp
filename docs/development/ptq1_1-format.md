@@ -269,6 +269,14 @@ file gives 9.5367/9.5407/9.5407/9.5524 against 9.5588/9.5578/9.5578/9.5620 for
 the fallback, which covers the `ncols_dst` 1, 2, 4 and 8 instantiations and the
 shared-memory epilogue. 64 tokens of greedy output are identical to PTQ1_0.
 
+Checks for the MMQ tile loader, on a text file with `-c 512 --chunks 3`:
+`llama-perplexity -b 512` gives 4.7727, 4.7695, 5.4195 for the tile path and
+4.7704, 4.7688, 5.4199 for the mat-vec path (`GGML_CUDA_PTQ1_1_MMVQ_MAX_BATCH`
+forced high), against PTQ1_0's 4.7706, 4.7682, 5.4232 on the same file. The two
+paths agree to the fourth decimal, which is the int8 MMA vs dp4a rounding, and
+both keep the PTQ1_0 gap. Every weight of the model goes through the loader, so
+this covers the codebook lookup, the escape binary search and the pooled tails.
+
 ## 10. Plumbing
 
 Order suggested by the round-trip first plan.
@@ -296,7 +304,10 @@ Kernels, after the round-trip passes: `vec_dot_ptq1_0_q8_1_multi`,
 
 Done since: `getrows.cu` (`k_get_rows_ptq1_1`), the CPU `GET_ROWS` path, and
 two mat-vec kernels in `ggml/src/ggml-cuda/mmvq-ptq1_1.cuh`. How they work, with
-a worked example, is [ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md):
+a worked example, is [ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md). The decode
+helpers they share with the tile path (`ptq1_1_tail8`, `ptq1_1_code`,
+`ptq1_1_scale` and the `ptq1_1_tables` record) live in
+`ggml/src/ggml-cuda/common.cuh` and `ptq1_1-tables.cuh`:
 
 - `mul_mat_vec_ptq1_1_pt` is the fast path for plain 2D `MUL_MAT` with 1 to 8
   columns. It takes the PTQ1_0 geometry (`ptq1_0_pt_block_dot`, the
@@ -322,12 +333,11 @@ kernel takes; `GGML_CUDA_PTQ1_1_PT=0` forces the fallback for A/B runs. Neither
 kernel supports `MUL_MAT_ID` (weights for MoE experts would need the escape list
 indexed by expert).
 
-Measured on an RTX 4060 Laptop with the 27B model, idle GPU: pp512 about 43 t/s
-(`llama-bench`, against PTQ1_0's 570) and decode 30.7 t/s (token by token, no
-sampling, against PTQ1_0's 33.5 to 39.6). Decode is therefore 10 to 25% behind
-PTQ1_0, and the remainder is the per-block pattern and tail decode, see
-[ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md) section 6. Before the PT kernel this
-decode rate was 16.7 t/s, so the same file is 1.8x faster now.
+Measured on an RTX 4060 Laptop with the 27B model, idle GPU: decode 30.7 t/s
+(token by token, no sampling, against PTQ1_0's 33.5 to 39.6). Decode is
+therefore 10 to 25% behind PTQ1_0, and the remainder is the per-block pattern and
+tail decode, see [ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md) section 6. Before the
+PT kernel this decode rate was 16.7 t/s, so the same file is 1.8x faster now.
 
 Graph fusion works for PTQ1_1: `mul_mat_vec_ptq1_1_pt` and the `block_q8_1`
 fallback take the `ggml_cuda_mm_fusion_args_device` epilogue, so
@@ -335,10 +345,56 @@ fallback take the `ggml_cuda_mm_fusion_args_device` epilogue, so
 the one this model needs, qwen35 has no ffn bias. `MUL_MAT` + `ADD` also works
 through the same epilogue; the scale variants remain NVFP4 only.
 
+Prompt processing: `ggml_cuda_mmq_load_tiles_ptq1_1` in
+`ggml/src/ggml-cuda/mmq-load-tiles.cuh`, with config entries in
+`mmq-config-ampere.cuh`, a `CASE` row set and one
+`template-instances/mmq-instance-ptq1_1.cu`. It emits exactly the int8 tile and
+per-32-weight fp32 scales that PTQ1_0's loader emits, so
+`ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<..., MMQ_Q8_1_DS_LAYOUT_D4>` and the MMA
+write-back are unchanged. How it works, with the measured cost of each part, is
+[ptq1_1-mmq-tiles.md](ptq1_1-mmq-tiles.md). Three plumbing details:
+
+- The plan to pass the tables through `ggml_cuda_mmq_load_tiles_t` was dropped:
+  the loader is called through a `ggml_cuda_mmq_load_tiles` template dispatcher,
+  so the other loaders keep their signature. `mmq_args` and the `mul_mat_q`
+  kernel carry a `ptq1_1_tables` record.
+- `ggml_cuda_mmq_get_qk<type>()` keeps the MMQ k unit at 128 weights for PTQ1_1
+  (the type's own `qk` is 1024, which would make `blocks_per_iter` zero).
+- `should_use_mmq` takes PTQ1_1 when Turing MMA is available, and
+  `should_use_mmvq` keeps narrow batches on the PT kernel. The crossover is
+  measured: mat-vec 95 t/s against MMQ 61 t/s at 8 columns, a tie at 16, so
+  `GGML_CUDA_PTQ1_1_MMVQ_MAX_BATCH` defaults to 8. `MUL_MAT_ID` stays on the
+  mat-vec side, which asserts no ids, because an expert id would have to be
+  mapped back to its escape list.
+
+Measured with `llama-bench`, idle GPU, PTQ1_0 on the same build and file pair for
+reference:
+
+| | pp128 | pp512 | pp2048 |
+| --- | --- | --- | --- |
+| PTQ1_0 | 610 | 610 | 608 |
+| PTQ1_1 before | - | 41.6 | - |
+| PTQ1_1 now | 436 | 445 | 442 |
+
+So prefill is 10.7x faster than the mat-vec-only path and 73% of PTQ1_0. The
+remaining 27% is the tile loader: it decodes a 216-byte block into an int8 tile
+where PTQ1_0 copies a 28-byte one, and the MMA work is identical.
+[ptq1_1-mmq-tiles.md](ptq1_1-mmq-tiles.md) sections 5 and 6 break that down and
+list what is left.
+
+Decode is unchanged: one column still takes `mul_mat_vec_ptq1_1_pt` (29.5 t/s
+against 12.9 t/s for the tile path at `-p 1`).
+
 Still open:
 
-- The MMQ tile loader and `convert.cu`, so prompt processing leaves the mat-vec
-  path. That is the whole pp512 gap.
+- `convert.cu`, so the cuBLAS fallback works for this type. Without it, PTQ1_1
+  `MUL_MAT` has no third path: `should_use_mmq` must stay true for every shape it
+  cannot serve with the mat-vec.
+- The tile loader has no dp4a variant, so pre-Turing devices stay on the mat-vec
+  path, weighted by `should_use_mmq` returning false there.
+- A `MUL_MAT` whose `src0` is a view is not served by either path: the escape
+  list is registered against the tensor's own data pointer, and
+  `ptq1_1_tables_get` aborts instead of decoding with the wrong table.
 
 One loose end: the file records `general.file_type = 130`, which is the `ggml.h`
 number, while `llama.h` uses 144 for the same format and the PTQ1_0 file carries

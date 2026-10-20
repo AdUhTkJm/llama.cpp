@@ -631,7 +631,8 @@ The remaining large gap is not in this kernel: prompt processing does not use it
 
 ## 7. Traps when editing this kernel
 
-* `ptq1_1_tail8` reads three bytes for every sub-block. For sub-block 7 the third
+* `ptq1_1_tail8` (in `common.cuh`, since the MMQ tile loader also uses the
+  decode helpers from there) reads three bytes for every sub-block. For sub-block 7 the third
   read is `sc[0]`. That is safe only because the block is 216 bytes; do not turn
   it into a read of `qh[i0 + 2]` through an array bounds check that clamps, and do
   not move `qh` to the end of the struct.

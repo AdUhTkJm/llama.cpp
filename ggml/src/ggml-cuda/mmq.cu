@@ -1,10 +1,23 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "ptq1_1-tables.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
 #include <cstdint>
 #include <cstdlib>
+
+// The PTQ1_1 tile loader decodes the scale plane from the codebook, so the launch carries the
+// tables of its weight tensor. Every other type leaves the record empty.
+static ptq1_1_tables ggml_cuda_mmq_tables(const ggml_tensor * src0) {
+#if !defined(GGML_USE_HIP)
+    if (src0->type == GGML_TYPE_PTQ1_1) {
+        return ptq1_1_tables_get(src0, ggml_cuda_get_device());
+    }
+#endif
+    GGML_UNUSED(src0);
+    return {};
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -20,6 +33,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
             mul_mat_q_case<GGML_TYPE_PTQ1_0>(ctx, args, stream);
+            break;
+        case GGML_TYPE_PTQ1_1:
+            mul_mat_q_case<GGML_TYPE_PTQ1_1>(ctx, args, stream);
             break;
 #endif
         case GGML_TYPE_Q4_0:
@@ -211,7 +227,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, ggml_cuda_mmq_tables(src0)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -291,7 +307,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ggml_cuda_mmq_tables(src0)};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -356,7 +372,7 @@ void ggml_cuda_mul_mat_q_fused_two(
             src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),
             src0->ne[2], ne12, (int64_t)(src0->nb[2]/ts0), stride_q_channel, (int64_t)(dst->nb[2]/sizeof(float)),
             src0->ne[3], ne13, (int64_t)(src0->nb[3]/ts0), stride_q_sample, (int64_t)(dst->nb[3]/sizeof(float)),
-            dst->ne[1]};
+            dst->ne[1], ggml_cuda_mmq_tables(src0)};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
     };
     launch_one(src0_a, dst_a);
@@ -376,7 +392,12 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             mmq_supported = turing_mma_available(cc);
             break;
         case GGML_TYPE_PTQ1_1:
-            return false; // no tile loader; the type uses the dedicated mat-vec only
+            // the escape list is per tensor, so it cannot be resolved for an expert id
+            if (n_experts > 0) {
+                return false;
+            }
+            mmq_supported = turing_mma_available(cc);
+            break;
 #endif
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:

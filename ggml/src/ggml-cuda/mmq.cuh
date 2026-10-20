@@ -66,6 +66,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_PQ2_0:
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_PTQ1_1:
 #endif
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0:
@@ -111,6 +112,20 @@ struct tile_x_sizes {
     int dm;
     int sc;
 };
+
+// K granularity of the tile loader, in weights. Equal to the type's block size except for
+// PTQ1_1, whose 1024-weight super-block is loaded as eight 128-weight sub-blocks: the
+// sub-block is what matches MMQ_ITER_K, and all eight share one exponent pattern and the
+// pooled tail bytes.
+template <ggml_type type>
+static constexpr __host__ __device__ int ggml_cuda_mmq_get_qk() {
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_PTQ1_1) {
+        return 128;
+    }
+#endif
+    return ggml_cuda_type_traits<type>::qk;
+}
 
 // Decouple shared memory tile sizes from WARP_SIZE to allow for different warp sizes.
 // The K dimension of the tiles has either,
@@ -758,6 +773,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 -1, ggml_cuda_mmq_load_tiles_ptq1_0<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_PTQ1_1:
+            // the loader needs the pattern tables, so it is called through
+            // ggml_cuda_mmq_load_tiles and not through the function pointer table
+            return ggml_cuda_mmq_util_funcs(
+                -1, nullptr,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 #endif
         case GGML_TYPE_Q4_0:
             return ggml_cuda_mmq_util_funcs(
@@ -897,6 +919,22 @@ static constexpr __device__ ggml_cuda_mmq_load_tiles_t ggml_cuda_mmq_get_load_ti
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().load_tiles;
 }
 
+// The PTQ1_1 loader also needs the codebook and the escape list of its tensor. Passing them
+// here instead of extending ggml_cuda_mmq_load_tiles_t keeps the other loaders untouched.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles(
+        const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride,
+        const ptq1_1_tables & tbl) {
+#if !defined(GGML_USE_HIP)
+    if constexpr (type == GGML_TYPE_PTQ1_1) {
+        ggml_cuda_mmq_load_tiles_ptq1_1<type, J, fallback>(x, x_tile, kbx0, i_max, stride, tbl);
+        return;
+    }
+#endif
+    GGML_UNUSED(tbl);
+    ggml_cuda_mmq_get_load_tiles<type, J, fallback>()(x, x_tile, kbx0, i_max, stride);
+}
+
 template <ggml_type type, int J, bool fallback>
 static constexpr __device__ ggml_cuda_mmq_vec_dot_t ggml_cuda_mmq_get_vec_dot() {
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().vec_dot;
@@ -915,13 +953,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const ptq1_1_tables & tbl) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
-    constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
+    constexpr int              qk         = ggml_cuda_mmq_get_qk<type>();
     constexpr int              I          = ggml_cuda_mmq_get_I(type, J, fallback);
-    constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, fallback>();
     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
 
@@ -946,6 +984,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // offset_x counts blocks of the tensor type, the loader counts qk units
+    constexpr int k_ratio         = ggml_cuda_type_traits<type>::qk / qk;
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
@@ -962,10 +1002,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 cp_async_cg_16<256>(
                     ggml_cuda_cvta_generic_to_shared(tile_y_bytes + byte0), by0 + byte0);
             }
-            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, tile_x_max_i, stride_row_x, tbl);
             cp_async_wait_all();
         } else {
-            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            ggml_cuda_mmq_load_tiles<type, J, fallback>(x, tile_x, offset_x*k_ratio + kb0, tile_x_max_i, stride_row_x, tbl);
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -1058,7 +1098,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const ptq1_1_tables tbl) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1068,7 +1108,7 @@ static __global__ void mul_mat_q(
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
-    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qk        = ggml_cuda_mmq_get_qk<type>();
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
 
     const uint32_t nty = (nrows_x + I - 1) / I; // Number of tiles y
@@ -1155,7 +1195,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, tbl);
         return;
     }
 
@@ -1249,7 +1289,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, tbl);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1333,7 +1373,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, tbl);
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1346,7 +1386,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
-    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int qk              = ggml_cuda_mmq_get_qk<type>();
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
@@ -1481,6 +1521,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    ptq1_1_tables tables = {}; // PTQ1_1 only; the other loaders ignore it
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1521,7 +1562,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int channel_ratio = args.nchannels_y / args.nchannels_x;
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
-    const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_cuda_type_traits<type>::qk);
+    const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_cuda_mmq_get_qk<type>());
     const uint3 ntx_fd             = init_fastdiv_values(ntx);
     const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
@@ -1534,7 +1575,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, args.tables);
         return;
     }
 
@@ -1563,7 +1604,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, args.tables);
 
     if (!fixup_needed) {
         return;
@@ -1678,6 +1719,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
 extern DECL_MMQ_CASE(GGML_TYPE_PQ2_0);
 #if !defined(GGML_USE_HIP)
 extern DECL_MMQ_CASE(GGML_TYPE_PTQ1_0);
+extern DECL_MMQ_CASE(GGML_TYPE_PTQ1_1);
 #endif
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);

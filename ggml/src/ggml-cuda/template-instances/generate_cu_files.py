@@ -44,6 +44,7 @@ TYPES_MMQ = [
     "GGML_TYPE_Q2_0",
     "GGML_TYPE_PQ2_0",
     "GGML_TYPE_PTQ1_0",
+    "GGML_TYPE_PTQ1_1",
     "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0",
     "GGML_TYPE_Q2_K", "GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K",
     "GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S", "GGML_TYPE_IQ3_XXS", "GGML_TYPE_IQ3_S",
@@ -131,7 +132,7 @@ for type_kv in TYPES_KV_MMA_NATIVE:
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
-        source = SOURCE_MMQ_CUDA_ONLY if type == "GGML_TYPE_PTQ1_0" else SOURCE_MMQ
+        source = SOURCE_MMQ_CUDA_ONLY if type in ("GGML_TYPE_PTQ1_0", "GGML_TYPE_PTQ1_1") else SOURCE_MMQ
         f.write(source.format(type=type))
 
 for type in range(1, 17):

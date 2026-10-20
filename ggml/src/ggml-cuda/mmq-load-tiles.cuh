@@ -355,6 +355,129 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
 }
 #endif
 
+// PTQ1_1 is a PTQ1_0 block of 1024 weights: the 24 qs bytes of each 128-weight sub-block are
+// byte-identical to a PTQ1_0 block, so lanes 0..5 run the same branch-free unpack. Two things
+// differ, and both are about the parts PTQ1_1 moved out of the block: the eight tail trits of
+// a sub-block are pooled with the tails of the other seven in qh, and the fp16 scale of a
+// sub-block is an exponent from the shared 8-exponent pattern plus a 10-bit mantissa in sc.
+//
+// kbx0 and stride count 128-weight sub-blocks here, not blocks: one super-block is eight of
+// them and MMQ_ITER_K covers blocks_per_iter of them per iteration.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_1(const char * __restrict__ x,
+                                                                      int * __restrict__ x_tile,
+                                                                      const int kbx0,
+                                                                      const int i_max,
+                                                                      const int stride,
+                                                                      const ptq1_1_tables & tbl) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    // MMA data layout only: 64 int8 words per row, then one fp32 scale per 32 weights.
+    int *   x_qs = (int *) x_tile;
+    float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
+
+    constexpr int qk_sub                  = 128;
+    constexpr int blocks_per_iter         = MMQ_ITER_K / qk_sub;
+    constexpr int scale_entries_per_block = qk_sub / QK8_1;
+    constexpr int threads_per_block       = 8;
+    constexpr int threads_per_row         = blocks_per_iter * threads_per_block;
+    constexpr int nrows                   = warp_size / threads_per_row;
+    constexpr int subs_per_row            = QK_PTQ1_1 / qk_sub;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / threads_per_block;
+    const int lane = txi % threads_per_block;
+
+    const int stride_sub = stride * subs_per_row;
+
+    // Elements 120..127 are the eight pooled tail trits of a sub-block, and no single lane should
+    // expand them: the 32 lanes of a warp hold exactly the 4 x 8 tail digits of the two rows and
+    // two sub-blocks it covers, so each lane decodes one digit and stores one byte. The byte and
+    // the base-3 state depend on the pool position only, which does not change along the row
+    // loop (a row step is a whole super-block), so both are resolved once here.
+    const int tk    = threadIdx.x & 7;
+    const int tkbx  = (threadIdx.x >> 3) % blocks_per_iter;
+    const int tp    = 8 * ((kbx0 + tkbx) % subs_per_row) + tk;
+    const int tbyte = tp / 5;
+    const int tn    = tp % 5;
+    uint32_t pow3_t = 1;                                  // 3^tn
+    for (int i = 0; i < tn; ++i) {
+        pow3_t *= 3;
+    }
+    const uint32_t pow3_t1   = 3 * pow3_t;                // 3^(tn+1)
+    const int      tflat0    = kbx0 + tkbx;
+    const int      tsb0      = tflat0 / subs_per_row;
+    uint8_t * const trow_off = (uint8_t *) (x_qs + tkbx * (qk_sub / 4)) + 120 + tk;
+
+    const bool full_lane = lane < 6;
+
+    for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
+        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const int flat_sub = kbx0 + i * stride_sub + kbx;
+        const int sub      = flat_sub % subs_per_row;
+        const block_ptq1_1 * bxi = (const block_ptq1_1 *) x + flat_sub / subs_per_row;
+
+        int * row = x_qs + i * sram_stride + kbx * (qk_sub / 4);
+
+        const uint32_t packed = get_int_b4(bxi->qs[sub], lane < 7 ? lane : 6);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);   // bytes 0,1 as 16-bit lanes
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);   // bytes 2,3
+        const int  dst_base   = lane < 4 ? lane : 16 + lane;      // lanes 4,5 -> 20,21
+        const int  dst_stride = lane < 4 ? 4 : 2;
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+            if (full_lane) {
+                row[dst_base + t * dst_stride] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            }
+        }
+
+        // One pooled tail digit. State after n steps is (3^n * v) mod 256, so digit n of b is
+        // (3^(n+1) * b) >> 8 minus 3 * ((3^n * b) >> 8): two multiplies and no loop.
+        const uint32_t tb = ((const block_ptq1_1 *) x + tsb0 + i * stride)->qh[tbyte];
+        *(trow_off + i * sram_stride * sizeof(int)) =
+            (uint8_t) ((((pow3_t1 * tb) >> 8) - 3 * ((pow3_t * tb) >> 8)) - 1);
+    }
+
+    constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp         = warp_size / scale_entries_per_row;
+    const int     ksx                   = threadIdx.x % scale_entries_per_row;
+    const int     scale_block           = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / scale_entries_per_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        // the flat sub-block index is also the flat super-block index the escape list is keyed by
+        const int flat_sub = kbx0 + i * stride_sub + scale_block;
+        const int64_t sb   = flat_sub / subs_per_row;
+        const int     sub  = flat_sub % subs_per_row;
+
+        const block_ptq1_1 * bxi = (const block_ptq1_1 *) x + sb;
+
+        // 767 codes read as one aligned 8-byte word; only the escape needs the packed bytes
+        const int code = ptq1_1_code(bxi);
+        const float d  = code < 767
+            ? ptq1_1_scale_exp(bxi, ptq1_1_pattern_exp64(tbl.codebook64[code], sub), sub)
+            : ptq1_1_scale(bxi, ptq1_1_pattern(bxi, sb, tbl.codebook, tbl.esc_patt, tbl.esc_idx, tbl.n_esc), sub);
+
+        x_df[i * sram_stride + ksx] = d;
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
