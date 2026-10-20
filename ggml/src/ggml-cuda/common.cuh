@@ -1154,9 +1154,9 @@ struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_1> {
 // Every layout keeps block_q8_1's bytes per row, so launcher strides in block_q8_1 units are valid
 // for all three; only the byte order inside a column differs.
 enum ggml_cuda_q8_1_layout : int {
-    GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0 cases below)
+    GGML_CUDA_Q8_1_AOS      = 0, // plain block_q8_1 array (every type except the PTQ1_0 and PTQ1_1 cases below)
     GGML_CUDA_Q8_1_SOA_ISUM = 1, // PTQ1_0, one column: warp-transposed, exact int sums (ggml_cuda_ptq1_q8_word)
-    GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0, 2-8 columns or MoE ids: planar-transposed (mmvq-ptq1_0.cuh)
+    GGML_CUDA_Q8_1_PT       = 2, // PTQ1_0 2-8 columns or MoE ids, PTQ1_1 1-8 columns: planar-transposed (mmvq-ptq1_0.cuh, mmvq-ptq1_1.cuh)
     GGML_CUDA_Q8_1_PQ2      = 3, // PQ2_0, 3-8 columns, plain 2D, Ada: permuted qs plus half2 (d, int sum) per block (mmvq-pq2_0.cuh)
 };
 
@@ -1404,6 +1404,17 @@ static inline bool ggml_cuda_pq2_multicol(int ncols_dst) {
 static inline ggml_cuda_q8_1_layout ggml_cuda_q8_1_layout_host(ggml_type type_src0, int ncols_dst, bool has_ids, bool plain_2d = true) {
     if (type_src0 == GGML_TYPE_PQ2_0 && plain_2d && !has_ids && ggml_cuda_pq2_multicol(ncols_dst)) {
         return GGML_CUDA_Q8_1_PQ2;
+    }
+    if (type_src0 == GGML_TYPE_PTQ1_1) {
+        // PTQ1_1 has one dedicated kernel for 1-8 columns (mmvq-ptq1_1.cuh). It only handles plain
+        // 2D, and it is the only consumer of the planar layout for this type, so everything else
+        // stays on block_q8_1 for the fallback kernel. GGML_CUDA_PTQ1_1_PT=0 forces the fallback.
+        static const bool ptq1_1_pt = [] {
+            const char * env = getenv("GGML_CUDA_PTQ1_1_PT");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        return (ptq1_1_pt && plain_2d && !has_ids && ncols_dst >= 1 && ncols_dst <= 8) ?
+            GGML_CUDA_Q8_1_PT : GGML_CUDA_Q8_1_AOS;
     }
     const ggml_cuda_q8_1_layout l = ggml_cuda_q8_1_layout_for(type_src0, ncols_dst, has_ids);
     if (l == GGML_CUDA_Q8_1_SOA_ISUM && ggml_cuda_batch_invariant()) {

@@ -261,6 +261,14 @@ int8 MMQ tile path and PTQ1_1 the dp4a mat-vec, not from the weight bytes. Runni
 the embedding matrix on the host instead of the device reproduces the CUDA
 numbers to the last digit, which covers the escape path on both sides.
 
+Checks for the PT mat-vec, all on the 27B model: `llama-perplexity` over 3
+chunks gives 5.3994 with the PT kernel and 5.3994 with the fallback
+(`GGML_CUDA_PTQ1_1_PT=0`), against PTQ1_0's 5.3906, so the planar kernel agrees
+with the block_q8_1 one and keeps the PTQ1_0 gap. With `-b 1/2/4/8` the same
+file gives 9.5367/9.5407/9.5407/9.5524 against 9.5588/9.5578/9.5578/9.5620 for
+the fallback, which covers the `ncols_dst` 1, 2, 4 and 8 instantiations and the
+shared-memory epilogue. 64 tokens of greedy output are identical to PTQ1_0.
+
 ## 10. Plumbing
 
 Order suggested by the round-trip first plan.
@@ -286,17 +294,52 @@ Kernels, after the round-trip passes: `vec_dot_ptq1_0_q8_1_multi`,
 `ptq1_0_pt_block_dot`, `ggml_cuda_mmq_load_tiles_ptq1_0`, `convert.cu` /
 `getrows.cu`. These are the four consumers of `block_ptq1_0`.
 
-Done since: `getrows.cu` (`k_get_rows_ptq1_1`), a dedicated
-`mul_mat_vec_ptq1_1` in `ggml/src/ggml-cuda/mmvq-ptq1_1.cuh` with the packed
-trit dot `vec_dot_ptq1_1_q8_1_patt`, and the CPU `GET_ROWS` path. The kernel
-handles channels and samples, chunks wide batches in groups of 8, and does not
-support `MUL_MAT_ID` (weights for MoE experts would need the escape list indexed
-by expert).
+Done since: `getrows.cu` (`k_get_rows_ptq1_1`), the CPU `GET_ROWS` path, and
+two mat-vec kernels in `ggml/src/ggml-cuda/mmvq-ptq1_1.cuh`. How they work, with
+a worked example, is [ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md):
 
-Still open: the MMQ tile loader, `convert.cu`, and the two PTQ1_0 fast paths
-(`vec_dot_ptq1_0_q8_1_multi`, `ptq1_0_pt_block_dot`) adapted to PTQ1_1. On an
-RTX 4060 Laptop with the 27B model that gap is pp512 41.7 t/s and tg128 16.5 t/s
-against PTQ1_0's 510 t/s and 35.8 t/s.
+- `mul_mat_vec_ptq1_1_pt` is the fast path for plain 2D `MUL_MAT` with 1 to 8
+  columns. It takes the PTQ1_0 geometry (`ptq1_0_pt_block_dot`, the
+  planar-transposed q8_1 layout, one thread per (row group, 128-weight block)),
+  reuses the PT plane stride and the 5-trit digit step from `mmvq-ptq1_0.cuh`,
+  and swaps only the weight decode: `ptq1_1_tail8` unpacks the pooled tail trits,
+  `ptq1_1_scale` resolves the exponent pattern once per block.
+- `mul_mat_vec_ptq1_1` is the fallback: one output row per thread, the whole K
+  range per thread, plain `block_q8_1` activations. It covers batched `MUL_MAT`
+  (channels or samples, which has no 2D PT quantization) and wide batches, which
+  it walks in groups of 8 columns.
+
+The super-block is deliberately not the unit of work of the PT kernel. One
+thread per super-block was the first attempt and it is slower: a 5120-wide row
+holds 5 super-blocks, so a lane reads 216 bytes that no neighbour touches and
+the warp loses the coalescing that makes the PTQ1_0 kernel fast. At 128-weight
+blocks a warp stays on consecutive blocks of the same rows. That change alone
+was tg128 20.7 -> 31.1 t/s on the 27B model.
+
+`ggml_cuda_q8_1_layout_host` picks the planar layout for PTQ1_1 only when the
+call is plain 2D, has no ids and at most 8 columns, which is exactly what the PT
+kernel takes; `GGML_CUDA_PTQ1_1_PT=0` forces the fallback for A/B runs. Neither
+kernel supports `MUL_MAT_ID` (weights for MoE experts would need the escape list
+indexed by expert).
+
+Measured on an RTX 4060 Laptop with the 27B model, idle GPU: pp512 about 43 t/s
+(`llama-bench`, against PTQ1_0's 570) and decode 30.7 t/s (token by token, no
+sampling, against PTQ1_0's 33.5 to 39.6). Decode is therefore 10 to 25% behind
+PTQ1_0, and the remainder is the per-block pattern and tail decode, see
+[ptq1_1-pt-matvec.md](ptq1_1-pt-matvec.md) section 6. Before the PT kernel this
+decode rate was 16.7 t/s, so the same file is 1.8x faster now.
+
+Still open:
+
+- The MMQ tile loader and `convert.cu`, so prompt processing leaves the mat-vec
+  path. That is the whole pp512 gap.
+- Graph fusion. `ggml_cuda_should_fuse_mul_mat_vec_q` returns false for PTQ1_1,
+  so none of the fused mat-vec variants run: `MUL_MAT` + `ADD` (bias),
+  `MUL_MAT` + `MUL_MAT` + `GLU` (gate/up), and `MUL_MAT` + `ADD` + `MUL_MAT` +
+  `ADD` + `GLU`. Only the gate/up one fires on this model, qwen35 has no ffn
+  bias. Both kernels need a `ggml_cuda_mm_fusion_args_device` epilogue before
+  that check can be relaxed; `mul_mat_vec_ptq1_1_pt` already picks the lane that
+  writes the row, so that is the place to add it.
 
 One loose end: the file records `general.file_type = 130`, which is the `ggml.h`
 number, while `llama.h` uses 144 for the same format and the PTQ1_0 file carries

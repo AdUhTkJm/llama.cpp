@@ -1441,9 +1441,19 @@ static void mul_mat_vec_q_switch_type(
 #if !defined(GGML_USE_HIP)
     if (type_x == GGML_TYPE_PTQ1_1) {
         // MUL_MAT_ID is not supported: the escape list cannot be resolved from the ids.
-        // The launcher chunks the columns in groups of 8, so ncols_dst is not limited.
-        GGML_ASSERT(!ids && y_layout == GGML_CUDA_Q8_1_AOS);
+        // Plain 2D with 1-8 columns takes the PT kernel, whose activation layout
+        // ggml_cuda_q8_1_layout_host picked above; batched MUL_MAT walks the columns as
+        // block_q8_1 in groups of 8.
+        GGML_ASSERT(!ids);
         const ptq1_1_tables t = ptq1_1_tables_get(src0, ggml_cuda_get_device());
+        if (y_layout == GGML_CUDA_Q8_1_PT) {
+            GGML_ASSERT(nchannels_dst == 1 && nsamples_dst == 1);
+            mul_mat_vec_ptq1_1_pt_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst,
+                                         stride_row_x, stride_col_y, stride_col_dst,
+                                         sb_row_base, t, stream);
+            return;
+        }
+        GGML_ASSERT(y_layout == GGML_CUDA_Q8_1_AOS);
         mul_mat_vec_ptq1_1_switch(vx, vy, dst, ncols_x, nrows_x, ncols_dst,
                                   stride_row_x, stride_col_y, stride_col_dst,
                                   nchannels_x, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1766,7 +1776,9 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int stride_col_y = src1_padded_row_size / QK8_1;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
-    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) src1_ncols, false);
+    // same (type, ncols_dst, ids, plain_2d) the quantizer saw, so the layout matches
+    const ggml_cuda_q8_1_layout y_layout = ggml_cuda_q8_1_layout_host(src0->type, (int) src1_ncols, false,
+            src1->ne[2] == 1 && src1->ne[3] == 1);
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, y_layout, row_low, src0, stream);
