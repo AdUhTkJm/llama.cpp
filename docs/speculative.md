@@ -484,6 +484,17 @@ Specifies a comma-separated list of speculative decoding types to use.
 ./llama-server [...] --spec-type ngram-mod,ngram-map-k4v
 ```
 
+Draftless implementations can be chained so that the second one only drafts when the first produces
+nothing, which is useful for covering different repetition patterns with one server:
+
+```bash
+./llama-server [...] --spec-type ngram-map-k,ngram-suffix
+```
+
+The order is fixed by the implementation list in `common_speculative_init`, not by the order given on
+the command line, and the verify batch size is the maximum over all enabled types. The per-implementation
+`statistics` lines (trace verbosity) show which one fired.
+
 ### `--spec-ngram-*-size-n N`
 
 Sets the size N of the lookup n-gram for n-gram map based speculative decoding.
