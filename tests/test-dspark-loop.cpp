@@ -369,7 +369,7 @@ int main(int argc, char ** argv) {
     sparams.draft.n_max   = block_size;
     sparams.draft.n_min   = 0;
 
-    common_speculative * spec = common_speculative_init(sparams, /* n_seq = */ 1);
+    common_speculative * spec = common_speculative_init(sparams, 1, nullptr);
     if (!spec) {
         fail("common_speculative_init returned null");
     }

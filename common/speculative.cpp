@@ -53,7 +53,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"indent",        COMMON_SPECULATIVE_TYPE_INDENT}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -3280,6 +3281,224 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// drafts the indentation of source code
+//
+// keeps the brace depth of the generated text and uses it to draft the whitespace that follows a
+// newline or an opening brace. the draft tokens are derived from the vocab at init, because the
+// tokenizer decides how a run of spaces is split - it usually merges the last space with the next word.
+struct common_speculative_impl_indent : public common_speculative_impl {
+    struct indent_tokens {
+        llama_token  nl = -1; // token that emits "\n", -1 if the tokenizer fuses it with the spaces
+        llama_tokens spaces;  // tokens that cover only spaces, e.g. "   " for a 4-space indent
+    };
+
+    struct seq_state {
+        size_t  n_processed   = 0;
+        int32_t depth         = 0;
+        bool    at_line_start = false;
+        bool    in_line_comment  = false;
+        bool    in_block_comment = false;
+        char    in_string     = 0; // 0, '"' or '\''
+        char    last_c        = 0;
+    };
+
+    std::vector<indent_tokens> table; // table[n_spaces]
+
+    std::vector<seq_state> states;
+
+    std::vector<char> piece; // scratch buffer for the token pieces
+
+    const llama_vocab * vocab = nullptr;
+
+    int32_t n_indent = 4;
+
+    common_speculative_impl_indent(const common_params_speculative & params, uint32_t n_seq, const llama_vocab * vocab)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_INDENT, n_seq)
+        , states(n_seq)
+        , vocab(vocab)
+        , n_indent(std::max(1, params.indent.n_indent))
+    {
+        const int32_t n_depth = std::max(1, params.indent.n_depth);
+
+        SPC_TRC("%s", "adding speculative implementation 'indent'\n");
+        SPC_TRC("- n_indent=%d, n_depth=%d\n", n_indent, n_depth);
+
+        if (vocab == nullptr) {
+            SPC_WRN("%s", "no vocab, 'indent' will not draft anything\n");
+            return;
+        }
+
+        const int32_t n_spaces_max = n_indent*n_depth;
+        table.resize(n_spaces_max + 1);
+
+        std::vector<char> buf(256);
+        std::vector<llama_token> tokens;
+        for (int32_t n = 0; n <= n_spaces_max; ++n) {
+            // probe with a letter - the tokenizer merges the last space of the run with the next word
+            std::string s = "\n" + std::string(n, ' ') + "a";
+
+            tokens.resize(s.size() + 8);
+            const int n_tok = llama_tokenize(vocab, s.data(), (int32_t) s.size(), tokens.data(), (int32_t) tokens.size(), false, false);
+            if (n_tok <= 0) {
+                continue;
+            }
+            tokens.resize(n_tok);
+
+            const int32_t run_end = 1 + n; // bytes of "\n" + spaces
+            int32_t off = 0;
+            bool fused = false; // the tokenizer merged the newline with the spaces
+            for (llama_token token : tokens) {
+                const int n_piece = llama_token_to_piece(vocab, token, buf.data(), (int32_t) buf.size(), 0, false);
+                if (n_piece <= 0 || off + n_piece > run_end) {
+                    break;
+                }
+                if (off == 0 && buf[0] == '\n') {
+                    if (n_piece == 1) {
+                        table[n].nl = token;
+                    } else {
+                        fused = true;
+                    }
+                } else {
+                    table[n].spaces.push_back(token);
+                }
+                off += n_piece;
+            }
+            if (fused) {
+                table[n] = indent_tokens();
+            }
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        states[seq_id] = seq_state();
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        // TODO: implement
+        return true;
+    }
+
+    void feed_token(seq_state & st, llama_token token) {
+        char buf[256];
+        const char * ptr = buf;
+
+        int n_piece = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, false);
+        if (n_piece < 0) {
+            // the piece does not fit in the stack buffer
+            piece.resize(-n_piece);
+            n_piece = llama_token_to_piece(vocab, token, piece.data(), (int32_t) piece.size(), 0, false);
+            ptr = piece.data();
+        }
+        if (n_piece <= 0) {
+            return;
+        }
+
+        bool at_line_start = false;
+        for (int i = 0; i < n_piece; ++i) {
+            const char c = ptr[i];
+            if (c == '\n') {
+                st.in_line_comment = false;
+                at_line_start = true;
+                continue;
+            }
+            at_line_start = false;
+            if (st.in_line_comment) {
+                continue;
+            }
+            if (st.in_block_comment) {
+                if (c == '*' && i + 1 < n_piece && ptr[i + 1] == '/') {
+                    st.in_block_comment = false;
+                    ++i;
+                }
+                continue;
+            }
+            if (st.in_string) {
+                if (c == '\\') {
+                    ++i;
+                } else if (c == st.in_string) {
+                    st.in_string = 0;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < n_piece && ptr[i + 1] == '/') {
+                st.in_line_comment = true;
+                ++i;
+                continue;
+            }
+            if (c == '/' && i + 1 < n_piece && ptr[i + 1] == '*') {
+                st.in_block_comment = true;
+                ++i;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                st.in_string = c;
+                continue;
+            }
+            if (c == '{') {
+                ++st.depth;
+            } else if (c == '}') {
+                st.depth = std::max(0, st.depth - 1);
+            }
+        }
+
+        st.at_line_start = at_line_start;
+        st.last_c        = ptr[n_piece - 1];
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            auto & st = states[seq_id];
+
+            const auto & prompt = *dp.prompt;
+            if (prompt.size() < st.n_processed) {
+                // the history was truncated (context shift), rebuild the state from scratch
+                st = seq_state();
+            }
+            for (size_t i = st.n_processed; i < prompt.size(); ++i) {
+                feed_token(st, prompt[i]);
+            }
+            st.n_processed = prompt.size();
+
+            // the state as if `id_last` was already emitted
+            seq_state st_next = st;
+            feed_token(st_next, dp.id_last);
+
+            const int32_t depth = st_next.at_line_start || st_next.last_c == '{' ? st_next.depth : -1;
+            if (depth < 0) {
+                continue;
+            }
+
+            const int32_t n_spaces = depth*n_indent;
+            if (n_spaces >= (int32_t) table.size() || table[n_spaces].spaces.empty()) {
+                continue;
+            }
+
+            auto & result = *dp.result;
+            if (!st_next.at_line_start) {
+                // the newline that ends the current line is not emitted yet
+                if (table[n_spaces].nl < 0) {
+                    continue;
+                }
+                result.push_back(table[n_spaces].nl);
+            }
+            result.insert(result.end(), table[n_spaces].spaces.begin(), table[n_spaces].spaces.end());
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -3354,6 +3573,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_INDENT:        return "indent";
         default:                                    return "unknown";
     }
 }
@@ -3456,6 +3676,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_INDENT:
+                n_max = std::max(n_max, (int32_t) 4);
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -3632,7 +3855,7 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 // initialization of the speculative decoding system
 //
-common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq, const llama_vocab * vocab) {
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -3645,7 +3868,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3654,6 +3877,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_INDENT);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
@@ -3737,6 +3961,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_INDENT: {
+                impls.push_back(std::make_unique<common_speculative_impl_indent>(config.params, n_seq, vocab));
                 break;
             }
             default:

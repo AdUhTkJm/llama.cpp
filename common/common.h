@@ -180,6 +180,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_INDENT,        // self-speculative decoding of source code indentation
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -373,6 +374,11 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_indent {
+    int32_t n_indent = 4; // number of spaces per indentation level
+    int32_t n_depth  = 8; // maximum indentation depth to draft for
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -386,6 +392,8 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    common_params_speculative_indent indent;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -395,7 +403,14 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t res = needs_rs_seq ? draft.n_max : 0u;
+
+        // the indent speculator drafts one token; deeper rollbacks fall back to checkpoints
+        if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_INDENT) != types.end()) {
+            res = std::max<uint32_t>(res, 1);
+        }
+
+        return res;
     }
 };
 

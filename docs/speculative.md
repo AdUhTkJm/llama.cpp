@@ -235,6 +235,24 @@ Example Video:
 
 - See #19164
 
+### Indentation (`indent`)
+
+Drafts the indentation of source code. It keeps the brace depth of the generated text and uses it to predict the whitespace after a newline or an opening brace, so the draft is available even when the n-gram history has nothing to offer.
+
+- No draft model and no extra VRAM. The draft table is derived from the vocab once, at init
+- The draft tokens are taken from the tokenizer itself, because the tokenizer decides how a run of spaces is split. Many BPE tokenizers merge the last space of the indentation with the next word
+- Tracks `//` and `/* */` comments and string literals, so braces inside them do not change the depth
+- Drafts are short (one indentation token, plus a newline when the opening brace does not carry one), so this is a small but cheap win on generated code
+
+The indent width is set with `--spec-indent-w` (default: 4).
+
+**Example:**
+```
+llama-server [...] --spec-type ngram-map-k,indent
+```
+
+On models with recurrent or hybrid memory (e.g. Qwen3-Next style), a partially accepted draft normally falls back to KV checkpoints, and the cost of that restore can cancel out a short draft. The `indent` type therefore requests a rollback window of one token (`n_rs_seq = 1`), which costs about 150 MiB of VRAM at any context size and makes short drafts worthwhile.
+
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
@@ -254,7 +272,7 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|indent]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -446,6 +464,11 @@ Each n-gram implementation has its own parameter:
 - `--spec-ngram-simple-min-hits` for `ngram-simple`
 - `--spec-ngram-map-k-min-hits` for `ngram-map-k`
 - `--spec-ngram-map-k4v-min-hits` for `ngram-map-k4v`
+
+### `--spec-indent-w N`
+
+Sets the number of spaces per indentation level for the `indent` implementation (default is 4).
+Use it for code bases that use 2 spaces instead of 4.
 
 ## Statistics
 Each speculative decoding implementation prints statistics.

@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
     // init the speculator
     const auto & params_spec = params.speculative;
 
-    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
+    struct common_speculative * spec = common_speculative_init(params.speculative, 1, llama_model_get_vocab(model_tgt));
 
     if (spec == nullptr) {
         LOG_ERR("%s", "failed to initialize speculative decoding\n");

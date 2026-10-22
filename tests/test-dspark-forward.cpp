@@ -758,7 +758,7 @@ static int run_runtime_ab(const std::string & model_path, const char * backend =
                     params.draft.ctx_tgt = ctx;
                     params.draft.n_max   = depth;
                     params.draft.n_min   = 0;
-                    spec                 = common_speculative_init(params, 1);
+                    spec                 = common_speculative_init(params, 1, nullptr);
                     if (!spec) {
                         fail("common speculative init failed");
                     }
@@ -1029,7 +1029,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
                     params.draft.ctx_tgt = ctx;
                     params.draft.n_max   = keep;
                     params.draft.n_min   = 0;
-                    spec                 = common_speculative_init(params, 1);
+                    spec                 = common_speculative_init(params, 1, nullptr);
                     if (!spec) {
                         fail("prefix common runner init failed");
                     }
@@ -1109,7 +1109,7 @@ static int run_prefix_ab(const std::string & model_path, const char * backend = 
         params.draft.ctx_tgt = ctx;
         params.draft.n_max   = n_max;
         params.draft.n_min   = 0;
-        return common_speculative_init(params, n_seq);
+        return common_speculative_init(params, n_seq, nullptr);
     };
     for (const std::string & mode : { std::string("n-max-mismatch"), std::string("multiple-sequences") }) {
         unsetenv("LLAMA_DSPARK_CORRECTION_PREFIX");
