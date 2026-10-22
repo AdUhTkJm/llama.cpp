@@ -180,6 +180,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX,  // self-speculative decoding with an online suffix tree
     COMMON_SPECULATIVE_TYPE_INDENT,        // self-speculative decoding of source code indentation
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
@@ -379,6 +380,16 @@ struct common_params_speculative_indent {
     int32_t n_depth  = 8; // maximum indentation depth to draft for
 };
 
+// suffix decoding (arXiv:2411.04975): draft the continuation of the longest
+// context suffix that occurred before in the token history
+struct common_params_speculative_ngram_suffix {
+    int32_t max_depth  = 24;   // suffix-tree depth = max context-match length
+    int32_t n_max      = 24;   // maximum number of drafted tokens
+    int32_t n_min      = 3;    // discard drafts shorter than this
+    float   max_factor = 1.0f; // draft up to match_len * max_factor tokens
+    float   min_prob   = 0.1f; // stop drafting below this frequency probability
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -394,6 +405,13 @@ struct common_params_speculative {
 
     common_params_speculative_indent indent;
 
+    common_params_speculative_ngram_suffix ngram_suffix;
+
+    // recurrent-state rollback window (0 = disabled). works for any speculator,
+    // including the draftless ones, which otherwise pay a checkpoint save +
+    // replay decode for every partially accepted draft.
+    int32_t n_rs_seq = 0;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -408,6 +426,11 @@ struct common_params_speculative {
         // the indent speculator drafts one token; deeper rollbacks fall back to checkpoints
         if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_INDENT) != types.end()) {
             res = std::max<uint32_t>(res, 1);
+        }
+
+        // explicit rollback window for any speculator (draftless ones included)
+        if (n_rs_seq > 0) {
+            res = std::max<uint32_t>(res, (uint32_t) n_rs_seq);
         }
 
         return res;

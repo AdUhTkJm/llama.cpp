@@ -253,6 +253,25 @@ llama-server [...] --spec-type ngram-map-k,indent
 
 On models with recurrent or hybrid memory (e.g. Qwen3-Next style), a partially accepted draft normally falls back to KV checkpoints, and the cost of that restore can cancel out a short draft. The `indent` type therefore requests a rollback window of one token (`n_rs_seq = 1`), which costs about 150 MiB of VRAM at any context size and makes short drafts worthwhile.
 
+### Suffix Decoding (`ngram-suffix`)
+
+This model-free implementation builds an online, path-compressed suffix tree over the prompt and all
+tokens committed so far. Instead of a fixed-size n-gram key it matches the **longest** suffix of the
+current context that occurred earlier and drafts the continuation that most often followed it, scored
+by token frequency. The draft length adapts: a longer (more reliable) match may speculate deeper, and
+drafting stops when the continuation probability drops below `--spec-ngram-suffix-min-prob`. Drafts
+shorter than `--spec-ngram-suffix-n-min` are dropped, because they rarely pay for their verification rows.
+
+It is most useful when the output repeats structured text that is already in the context: code editing
+(the `diff` context of an edit tool call is recited verbatim), agentic tool loops, reasoning models that
+restate their thinking, summarization.
+
+```
+llama-server [...] --spec-type ngram-suffix --spec-ngram-suffix-n-max 24 --spec-ngram-suffix-max-factor 1.0
+```
+
+ref: Suffix Decoding, arXiv:2411.04975 (#26283)
+
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
 - ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
@@ -403,6 +422,39 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
                                         minimum hits for ngram-map-k4v speculative decoding (default: 1)
 ```
 
+### Suffix Decoding Parameters
+
+```
+--spec-ngram-suffix-max-depth           N
+                                        suffix-tree depth = max context-match length for ngram-suffix speculative decoding (default: 24)
+--spec-ngram-suffix-n-max               N
+                                        maximum number of draft tokens for ngram-suffix speculative decoding (default: 24)
+--spec-ngram-suffix-n-min               N
+                                        discard drafts shorter than this for ngram-suffix speculative decoding (default: 3)
+--spec-ngram-suffix-max-factor          F
+                                        draft up to match_len * F tokens for ngram-suffix speculative decoding (default: 1.0)
+--spec-ngram-suffix-min-prob            F
+                                        stop drafting below this frequency probability for ngram-suffix speculative decoding (default: 0.10)
+```
+
+### Recurrent-state rollback window
+
+```
+--spec-n-rs-seq                         N
+                                        recurrent-state rollback window in tokens, for any speculator (default: 0, disabled)
+```
+
+Models with recurrent or hybrid memory (e.g. Qwen3.5/3-Next style, gated delta net layers) cannot drop the
+tail of a partially accepted draft from their recurrent state, so the server saves a checkpoint before
+verifying and replays the accepted tokens afterwards. That path costs an extra decode of the accepted
+prefix on every round. With `--spec-n-rs-seq N` the last N positions keep snapshots
+(`llama_context_params::n_rs_seq`), a rollback of up to N tokens needs no checkpoint and no replay, and
+the cost is VRAM: the recurrent state buffers grow by a factor of `1 + N`.
+
+`n_rs_seq` applies to draftless speculators too (they default to 0). Size the window to the expected
+rollback, which is roughly `n_max + 1 - accepted_tokens`; shorter drafts need a smaller window.
+On an 8 GB card with a 27B hybrid model, one snapshot plane is ~130 MiB, so N should stay small.
+
 ### `--spec-type TYPE`
 
 Specifies a comma-separated list of speculative decoding types to use.
@@ -420,6 +472,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 | `ngram-map-k4v` | Use n-gram pattern matching with n-gram-keys and up to four m-gram values (experimental) |
 | `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
+| `ngram-suffix` | Use an online suffix tree, drafting the most frequent continuation of the longest matching context (suffix decoding) |
 
 **Example:** Server-instance used to refactor source code.
 ```bash

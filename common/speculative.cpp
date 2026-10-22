@@ -23,6 +23,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "suffix-tree.h"
 
 #include <algorithm>
 #include <cassert>
@@ -54,6 +55,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-suffix",  COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX},
     {"indent",        COMMON_SPECULATIVE_TYPE_INDENT}
 };
 
@@ -2867,6 +2869,103 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 };
 
+// suffix decoding: a model-free drafter backed by a per-sequence suffix tree
+// built over the prompt and the tokens committed so far. The draft is the
+// continuation that most often followed the longest matching context suffix.
+//
+// ref: arXiv:2411.04975
+struct common_speculative_impl_ngram_suffix : public common_speculative_impl {
+    common_params_speculative_ngram_suffix params;
+
+    // per-sequence suffix tree plus how many committed tokens are already in it
+    struct seq_state {
+        common_suffix_tree tree;
+        size_t n_inserted = 0;
+
+        explicit seq_state(int32_t max_depth) : tree(max_depth) {}
+    };
+    std::vector<seq_state> states;
+
+    common_speculative_impl_ngram_suffix(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX, n_seq)
+        , params(params.ngram_suffix)
+    {
+        SPC_TRC("%s", "adding speculative implementation 'ngram-suffix'\n");
+        SPC_TRC("- max_depth=%d, n_max=%d, n_min=%d, max_factor=%f, min_prob=%f\n",
+                this->params.max_depth, this->params.n_max, this->params.n_min,
+                this->params.max_factor, this->params.min_prob);
+
+        states.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            states.emplace_back(std::max(1, this->params.max_depth));
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id < (llama_seq_id) n_seq);
+
+        auto & st = states[seq_id];
+        st.tree.reset();
+        st.tree.extend(prompt);
+        st.n_inserted = prompt.size();
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        // TODO: implement
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            auto & st = states[seq_id];
+            const llama_tokens & prompt = *dp.prompt;
+
+            if (prompt.size() < st.n_inserted) {
+                // the history was truncated (e.g. context shift) -> rebuild
+                st.tree.reset();
+                st.tree.extend(prompt);
+            } else {
+                // only accepted tokens ever reach the prompt, so the tree only grows
+                for (size_t i = st.n_inserted; i < prompt.size(); ++i) {
+                    st.tree.append(prompt[i]);
+                }
+            }
+            st.n_inserted = prompt.size();
+
+            // the context is the tail of the committed prompt plus the token that
+            // was just sampled, which is not part of the tree yet
+            llama_tokens context;
+            const int32_t take = std::min<int32_t>((int32_t) prompt.size(), params.max_depth - 1);
+            context.reserve(take + 1);
+            context.insert(context.end(), prompt.end() - take, prompt.end());
+            context.push_back(dp.id_last);
+
+            const int32_t n_max = dp.n_max > 0 ? std::min(dp.n_max, params.n_max) : params.n_max;
+
+            common_suffix_draft draft = st.tree.speculate(
+                    context, n_max, params.max_factor, params.min_prob);
+
+            // a short draft is unlikely to pay for its verification rows
+            if ((int32_t) draft.tokens.size() < params.n_min) {
+                continue;
+            }
+
+            *dp.result = std::move(draft.tokens);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // noop
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_impl_ngram_simple : public common_speculative_impl {
     common_params_speculative_ngram_map params;
@@ -3573,6 +3672,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:  return "ngram-suffix";
         case COMMON_SPECULATIVE_TYPE_INDENT:        return "indent";
         default:                                    return "unknown";
     }
@@ -3676,6 +3776,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX:
+                n_max = std::max(n_max, std::max(0, spec->ngram_suffix.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_INDENT:
                 n_max = std::max(n_max, (int32_t) 4);
@@ -3868,7 +3971,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 13);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -3877,6 +3980,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_INDENT);
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
@@ -3961,6 +4065,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_SUFFIX: {
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_suffix>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_INDENT: {

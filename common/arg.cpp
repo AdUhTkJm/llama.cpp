@@ -4305,6 +4305,66 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
+        {"--spec-ngram-suffix-max-depth"}, "N",
+        string_format("suffix-tree depth = max context-match length for ngram-suffix speculative decoding (default: %d)", params.speculative.ngram_suffix.max_depth),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("suffix-tree depth must be at least 1");
+            }
+            params.speculative.ngram_suffix.max_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-n-max"}, "N",
+        string_format("maximum number of draft tokens for ngram-suffix speculative decoding (default: %d)", params.speculative.ngram_suffix.n_max),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ngram-suffix n-max must be at least 1");
+            }
+            params.speculative.ngram_suffix.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-n-min"}, "N",
+        string_format("discard drafts shorter than this for ngram-suffix speculative decoding (default: %d)", params.speculative.ngram_suffix.n_min),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ngram-suffix n-min must be at least 1");
+            }
+            params.speculative.ngram_suffix.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-max-factor"}, "F",
+        string_format("draft up to match_len * F tokens for ngram-suffix speculative decoding (default: %.1f)", params.speculative.ngram_suffix.max_factor),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_suffix.max_factor = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-suffix-min-prob"}, "F",
+        string_format("stop drafting below this frequency probability for ngram-suffix speculative decoding (default: %.2f)", params.speculative.ngram_suffix.min_prob),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (v < 0.0f || v > 1.0f) {
+                throw std::invalid_argument("ngram-suffix min-prob must be between 0 and 1");
+            }
+            params.speculative.ngram_suffix.min_prob = v;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-n-rs-seq"}, "N",
+        string_format("recurrent-state rollback window in tokens, for any speculator (default: %d, disabled)", params.speculative.n_rs_seq),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("n-rs-seq must not be negative");
+            }
+            params.speculative.n_rs_seq = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
         {"--spec-ngram-map-k4v-size-n"}, "N",
         string_format("ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k4v.size_n),
         [](common_params & params, int value) {
